@@ -101,11 +101,20 @@ def _hf_download(repo: str, filename: str, repo_type: str = "dataset") -> str:
         root = (HF_CACHE or Path(".hf_cache").resolve()) / "upstream"
         root.mkdir(parents=True, exist_ok=True)
         dest = root / filename.replace("/", "_")
-        print(f"  hf_hub_download failed ({type(exc).__name__}); retrying via curl: {url}",
+        print(f"  hf_hub_download failed ({type(exc).__name__}); fallback to public HF via curl: ",
               flush=True)
+        # The internal proxy (repo.ai.gato) connects but sends 0 body bytes for this
+        # file. The public HF (https://huggingface.co) redirects to a xet-bridge CDN
+        # that serves the file normally. Use curl -L to follow the redirect chain.
+        public_url = (
+            f"https://huggingface.co/{repo_type}s/{repo}/resolve/main/{filename}"
+        )
+        print(f"  {public_url}", flush=True)
+        if dest.exists():
+            dest.unlink()
         subprocess.run(
-            ["curl", "-fSL", "-C", "-", "--retry", "5", "--retry-delay", "3",
-             "--max-time", "1800", "-o", str(dest), url],
+            ["curl", "-fSL", "--retry", "5", "--retry-delay", "3",
+             "--max-time", "1800", "-o", str(dest), public_url],
             check=True,
         )
         return str(dest)
