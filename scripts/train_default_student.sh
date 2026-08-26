@@ -14,15 +14,15 @@ PROJ_DIM="${PROJ_DIM:-256}"
 MLP_DIM="${MLP_DIM:-512}"
 PAIRS="${PAIRS:-4096}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-default_5ds_500-371-1600-150-800_e${EPOCHS}_lr${LR}_blk_gov16_${RUN_TAG}}"
+RUN_NAME="${RUN_NAME:-default_5ds_500-371-150-100-500_e${EPOCHS}_lr${LR}_${RUN_TAG}}"
 LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
   "$TEACHER_ROOT/math5s"
   "$TEACHER_ROOT/mbpp_full"
-  "$TEACHER_ROOT/musique"
   "$TEACHER_ROOT/gov_report"
-  "$TEACHER_ROOT/repobench_p"
+  "$TEACHER_ROOT/multi_news"
+  "$TEACHER_ROOT/musique"
 )
 TEACHER_ROOTS="$(IFS=,; echo "${ROOTS[*]}")"
 
@@ -39,7 +39,7 @@ printf 'default student training\nmodel=%s\nteacher=%s\nrun=%s\nlog=%s\n' \
 "$PY" "$REPO/student/train_student.py" \
   --model "$MODEL" \
   --teacher-root "$TEACHER_ROOTS" \
-  --max-shards "500,371,1600,150,800" \
+  --max-shards "500,371,150,100,500" \
   --epochs "$EPOCHS" \
   --lr "$LR" \
   --seed "$SEED" \
