@@ -10,11 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import tarfile
+import urllib.request
+import zipfile
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import ClassLabel, Dataset, DatasetDict, Features, Sequence, Value, load_dataset
 from huggingface_hub import hf_hub_download
 
 
@@ -47,6 +50,55 @@ LONGBENCH_TASKS = [
     "repobench-p",
 ]
 
+# Four sources are still published on the Hub as loader scripts, which datasets 5.0
+# refuses to run ("Dataset scripts are no longer supported"). Each is read from its
+# official release instead, and rebuilt into the schema the loader script produced so
+# the downstream readers see the same columns.
+PIQA_URL = "https://storage.googleapis.com/ai2-mosaic/public/physicaliqa/physicaliqa-train-dev.zip"
+QASPER_URL = "https://qasper-dataset.s3.us-west-2.amazonaws.com/qasper-train-dev-v0.3.tgz"
+
+PIQA_FEATURES = Features({
+    "goal": Value("string"),
+    "sol1": Value("string"),
+    "sol2": Value("string"),
+    "label": ClassLabel(names=["0", "1"]),
+})
+
+QASPER_ANSWER = {
+    "unanswerable": Value("bool"),
+    "extractive_spans": Sequence(Value("string")),
+    "yes_no": Value("bool"),
+    "free_form_answer": Value("string"),
+    "evidence": Sequence(Value("string")),
+    "highlighted_evidence": Sequence(Value("string")),
+}
+
+QASPER_FEATURES = Features({
+    "id": Value("string"),
+    "title": Value("string"),
+    "abstract": Value("string"),
+    "full_text": Sequence({
+        "section_name": Value("string"),
+        "paragraphs": [Value("string")],
+    }),
+    "qas": Sequence({
+        "question": Value("string"),
+        "question_id": Value("string"),
+        "nlp_background": Value("string"),
+        "topic_background": Value("string"),
+        "paper_read": Value("string"),
+        "search_query": Value("string"),
+        "question_writer": Value("string"),
+        "answers": Sequence({
+            "answer": QASPER_ANSWER,
+            "annotation_id": Value("string"),
+            "worker_id": Value("string"),
+        }),
+    }),
+})
+
+MULTI_NEWS_REPO = "alexfabbri/multi_news"
+
 HF_CACHE: Path | None = None
 
 
@@ -56,17 +108,90 @@ def _load(repo: str, config: str | None = None, **kwargs) -> DatasetDict | Datas
     return load_dataset(repo, config, **kwargs) if config else load_dataset(repo, **kwargs)
 
 
+def _fetch(url: str, name: str) -> Path:
+    """Download an upstream archive into the throwaway cache, once."""
+    root = (HF_CACHE or Path(".hf_cache").resolve()) / "upstream"
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / name
+    if not dest.exists():
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with urllib.request.urlopen(url) as src, tmp.open("wb") as fh:
+            shutil.copyfileobj(src, fh)
+        tmp.rename(dest)
+    return dest
+
+
+def _piqa(split: str) -> Dataset:
+    """PIQA from the official release: one jsonl of questions, one file of labels."""
+    archive = _fetch(PIQA_URL, "physicaliqa-train-dev.zip")
+    with zipfile.ZipFile(archive) as zf:
+        rows = [json.loads(line) for line
+                in zf.read(f"physicaliqa-train-dev/{split}.jsonl").decode("utf-8").splitlines()]
+        labels = zf.read(f"physicaliqa-train-dev/{split}-labels.lst").decode("utf-8").split()
+    if len(rows) != len(labels):
+        raise ValueError(f"piqa {split}: {len(rows)} questions but {len(labels)} labels")
+    return Dataset.from_dict(
+        {
+            "goal": [r["goal"] for r in rows],
+            "sol1": [r["sol1"] for r in rows],
+            "sol2": [r["sol2"] for r in rows],
+            "label": [int(x) for x in labels],
+        },
+        features=PIQA_FEATURES,
+    )
+
+
+def _qasper_paper(paper_id: str, paper: dict) -> dict:
+    """One release paper in the columnar shape a datasets Sequence produces."""
+    full_text = paper.get("full_text") or []
+    qas = paper.get("qas") or []
+    keys = ["question", "question_id", "nlp_background", "topic_background",
+            "paper_read", "search_query", "question_writer"]
+    return {
+        "id": paper_id,
+        "title": paper.get("title") or "",
+        "abstract": paper.get("abstract") or "",
+        "full_text": {
+            "section_name": [s.get("section_name") or "" for s in full_text],
+            "paragraphs": [list(s.get("paragraphs") or []) for s in full_text],
+        },
+        "qas": {
+            **{k: [q.get(k) for q in qas] for k in keys},
+            "answers": [
+                {k: [a.get(k) for a in (q.get("answers") or [])]
+                 for k in ("answer", "annotation_id", "worker_id")}
+                for q in qas
+            ],
+        },
+    }
+
+
+def _qasper(split: str) -> Dataset:
+    """Qasper from the official v0.3 release; `split` is "train" or "dev"."""
+    archive = _fetch(QASPER_URL, "qasper-train-dev-v0.3.tgz")
+    with tarfile.open(archive) as tf:
+        member = tf.extractfile(f"qasper-{split}-v0.3.json")
+        if member is None:
+            raise ValueError(f"qasper-{split}-v0.3.json missing from {archive}")
+        raw = json.load(member)
+    return Dataset.from_list([_qasper_paper(k, v) for k, v in raw.items()],
+                             features=QASPER_FEATURES)
+
+
+def _multi_news(split: str) -> Dataset:
+    """Multi-News from the raw files the loader script read, with its newline fix."""
+    src = hf_hub_download(MULTI_NEWS_REPO, f"data/{split}.src.cleaned", repo_type="dataset")
+    tgt = hf_hub_download(MULTI_NEWS_REPO, f"data/{split}.tgt", repo_type="dataset")
+    with open(src, encoding="utf-8") as src_f, open(tgt, encoding="utf-8") as tgt_f:
+        pairs = [(s.strip().replace("NEWLINE_CHAR", "\n"), t.strip())
+                 for s, t in zip(src_f, tgt_f)]
+    return Dataset.from_dict({"document": [d for d, _ in pairs],
+                              "summary": [s for _, s in pairs]})
+
+
 def _write_parquet(ds: Dataset, path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     ds.to_parquet(str(path))
-    return len(ds)
-
-
-def _write_jsonl(ds: Dataset, path: Path) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as fh:
-        for row in ds:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     return len(ds)
 
 
@@ -130,10 +255,10 @@ def download_eval(root: Path) -> None:
     _write_source(root / "eval/arc_challenge/SOURCE.json", source_dataset="allenai/ai2_arc",
                   source_config="ARC-Challenge", rows=rows)
 
-    ds = _load("ybisk/piqa")
-    rows = {"validation.parquet": _write_parquet(ds["validation"], root / "eval/piqa/validation.parquet")}
+    ds = _piqa("dev")
+    rows = {"validation.parquet": _write_parquet(ds, root / "eval/piqa/validation.parquet")}
     _write_source(root / "eval/piqa/SOURCE.json", source_dataset="ybisk/piqa",
-                  source_config=None, rows=rows)
+                  source_config=None, source_url=PIQA_URL, rows=rows)
 
 
 def download_humaneval(root: Path) -> None:
@@ -186,20 +311,21 @@ def download_train(root: Path) -> None:
     _write_source(root / "train/gov_report/SOURCE.json",
                   source_dataset="ccdv/govreport-summarization", rows=rows)
 
-    ds = _load("allenai/qasper")
     rows = {
-        "train.parquet": _write_parquet(ds["train"], root / "train/qasper/train.parquet"),
-        "validation.parquet": _write_parquet(ds["validation"], root / "train/qasper/validation.parquet"),
+        "train.parquet": _write_parquet(_qasper("train"), root / "train/qasper/train.parquet"),
+        "validation.parquet": _write_parquet(_qasper("dev"), root / "train/qasper/validation.parquet"),
     }
-    _write_source(root / "train/qasper/SOURCE.json", source_dataset="allenai/qasper", rows=rows)
+    _write_source(root / "train/qasper/SOURCE.json", source_dataset="allenai/qasper",
+                  source_url=QASPER_URL, rows=rows)
 
     ds = _load("deepmind/narrativeqa")
     rows = {"train.parquet": _write_parquet(ds["train"], root / "train/narrativeqa/train.parquet")}
     _write_source(root / "train/narrativeqa/SOURCE.json", source_dataset="deepmind/narrativeqa", rows=rows)
 
-    ds = _load("alexfabbri/multi_news")
-    rows = {"train.parquet": _write_parquet(ds["train"], root / "train/multi_news/train.parquet")}
-    _write_source(root / "train/multi_news/SOURCE.json", source_dataset="alexfabbri/multi_news", rows=rows)
+    ds = _multi_news("train")
+    rows = {"train.parquet": _write_parquet(ds, root / "train/multi_news/train.parquet")}
+    _write_source(root / "train/multi_news/SOURCE.json", source_dataset=MULTI_NEWS_REPO,
+                  source_files=["data/train.src.cleaned", "data/train.tgt"], rows=rows)
 
     ds = _load("mandarjoshi/trivia_qa", "rc.web")
     rows = {"train.parquet": _write_parquet(ds["train"], root / "train/triviaqa/train.parquet")}
@@ -217,9 +343,10 @@ def download_train(root: Path) -> None:
     _write_source(root / "train/arc_challenge/SOURCE.json", source_dataset="allenai/ai2_arc",
                   source_config="ARC-Challenge", rows=rows)
 
-    ds = _load("ybisk/piqa")
-    rows = {"train.parquet": _write_parquet(ds["train"], root / "train/piqa/train.parquet")}
-    _write_source(root / "train/piqa/SOURCE.json", source_dataset="ybisk/piqa", rows=rows)
+    ds = _piqa("train")
+    rows = {"train.parquet": _write_parquet(ds, root / "train/piqa/train.parquet")}
+    _write_source(root / "train/piqa/SOURCE.json", source_dataset="ybisk/piqa",
+                  source_url=PIQA_URL, rows=rows)
 
     raw = hf_hub_download("dgslibisey/MuSiQue", "musique_ans_v1.0_train.jsonl", repo_type="dataset")
     out = root / "train/musique/musique_ans_v1.0_train.jsonl"
@@ -255,12 +382,21 @@ def download_train(root: Path) -> None:
 
 
 def download_longbench(root: Path) -> None:
+    """The repo's loader script cannot run under datasets 5.0, but the same repo also
+    holds data.zip -- the official release, one jsonl per task, already in the layout
+    the eval tasks read."""
+    archive = hf_hub_download("zai-org/LongBench", "data.zip", repo_type="dataset")
+    dst = root / "longbench/data"
+    dst.mkdir(parents=True, exist_ok=True)
     rows = {}
-    for task in LONGBENCH_TASKS:
-        ds = _load("zai-org/LongBench", task, split="test")
-        rows[f"{task}.jsonl"] = _write_jsonl(ds, root / f"longbench/data/{task}.jsonl")
+    with zipfile.ZipFile(archive) as zf:
+        for task in LONGBENCH_TASKS:
+            payload = zf.read(f"data/{task}.jsonl")
+            (dst / f"{task}.jsonl").write_bytes(payload)
+            rows[f"{task}.jsonl"] = sum(
+                1 for line in payload.decode("utf-8").splitlines() if line.strip())
     _write_source(root / "longbench/SOURCE.json", source_dataset="zai-org/LongBench",
-                  split="test", rows=rows)
+                  source_file="data.zip", split="test", rows=rows)
 
 
 def main() -> int:

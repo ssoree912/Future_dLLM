@@ -8,7 +8,7 @@
 
 ```bash
 conda env create -f environment.yml
-conda activate dllm
+conda activate future-dllm
 ```
 
 설치 관련 참고 자료입니다.
