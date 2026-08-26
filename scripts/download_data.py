@@ -11,9 +11,10 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 import urllib.request
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Value, load_dataset
@@ -300,8 +301,40 @@ def download_longbench(root: Path) -> None:
                   source_file="data.zip", split="test", rows=rows)
 
 
+class _Tee:
+    """Mirror stdout/stderr to a log file, matching the shell scripts' `tee` behaviour."""
+
+    def __init__(self, stream, log_fh):
+        self._stream = stream
+        self._log = log_fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+        self._stream.flush()
+        self._log.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+
+def _start_logging() -> Path:
+    """Tee this run into logs/download/download_<date>.log."""
+    log_dir = Path(__file__).resolve().parents[1] / "logs" / "download"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    fh = open(log_path, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    return log_path
+
+
 def main() -> int:
     global HF_CACHE
+
+    log_path = _start_logging()
+    print(f"download log -> {log_path}")
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=str(Path(__file__).resolve().parents[1] / "data"))

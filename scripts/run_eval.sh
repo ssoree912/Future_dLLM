@@ -18,6 +18,11 @@ MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/LLaDA-8B-Instruct}"
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 LONGBENCH_DATA="${LONGBENCH_DATA:-$DATA_ROOT/longbench/data}"
 
+RUN_TAG="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_FILE:-$REPO/logs/eval/${DATASET}_keep${KEEP}_${RUN_TAG}.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 LIKELIHOOD_TASK=0
 UNSAFE_TASK=0
 case "$DATASET" in

@@ -15,7 +15,7 @@ MLP_DIM="${MLP_DIM:-512}"
 PAIRS="${PAIRS:-4096}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="${RUN_NAME:-default_5ds_500-371-1600-150-800_e${EPOCHS}_lr${LR}_blk_gov16_${RUN_TAG}}"
-LOG_FILE="${LOG_FILE:-$REPO/logs/train_${RUN_NAME}.log}"
+LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
   "$TEACHER_ROOT/math5s"

@@ -9,7 +9,7 @@ DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 PROMPT_ROOT="${PROMPT_ROOT:-$REPO/artifacts/prompt_shards}"
 TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${LOG_FILE:-$REPO/logs/extract_default_teacher_${RUN_TAG}.log}"
+LOG_FILE="${LOG_FILE:-$REPO/logs/teacher_extract/extract_default_teacher_${RUN_TAG}.log}"
 
 DATASETS=(math5s mbpp_full gov_report multi_news musique)
 LIMITS=(500 371 150 100 500)
