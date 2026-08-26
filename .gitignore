@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.hf_cache/
+
+# Labels and checkpoints are large and reproducible; only the READMEs that
+# document their layout are tracked.
+artifacts/*
+!artifacts/README.md
+results/*
+
+# Run logs from training and evaluation.
+logs/
+
+# Model weights and datasets are downloaded locally but are not part of the code
+# release; only the READMEs that document their layout are tracked.
+model/*
+data/*
+!data/README.md

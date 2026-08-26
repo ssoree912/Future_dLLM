@@ -1,0 +1,28 @@
+# Generated from LongBench's own config/dataset2prompt.json and
+# config/dataset2maxlen.json, against the official zai-org/LongBench data.
+tag:
+  - longbench_fewshot_tasks
+  - longbench_tasks
+task: longbench_trec
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: LONGBENCH_DATA_DIR/trec.jsonl
+test_split: test
+doc_to_text: "Please determine the type of the question below. Here are some examples of questions.\n\n{{context}}\n{{input}}"
+doc_to_target: '{{answers}}'
+target_delimiter: ""
+process_results: !function metrics.get_classification_with_score
+generation_kwargs:
+  max_gen_toks: 64
+  do_sample: false
+  until: []
+metric_list:
+  - metric: "score"
+    aggregation: mean
+    higher_is_better: True
+  - metric: "classification_score"
+    aggregation: mean
+    higher_is_better: True
+metadata:
+  version: 6.0

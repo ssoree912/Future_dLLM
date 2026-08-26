@@ -1,0 +1,21 @@
+# pip install -r requirements.txt
+# torch is CUDA 12.4: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1
+transformers==4.46.3
+tokenizers==0.20.3
+huggingface_hub==0.36.2
+safetensors==0.8.0
+accelerate==1.14.0
+datasets==5.0.0
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==25.0.1
+tqdm==4.70.0
+
+# evaluation
+lm_eval==0.4.12
+rouge==1.0.1
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+sacrebleu==2.6.0
+math-verify==0.9.0

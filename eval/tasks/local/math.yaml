@@ -1,0 +1,33 @@
+tag:
+  - local_math_word_problems
+task: local_math
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    train: DATA_DIR/train/hendrycks_math/*/train-*.parquet
+    test: DATA_DIR/eval/hendrycks_math/*-test.parquet
+output_type: generate_until
+training_split: train
+test_split: test
+doc_to_text: !function local_math_utils.doc_to_text
+doc_to_target: "{{answer if few_shot is undefined else solution}}"
+process_docs: !function local_math_utils.process_docs
+process_results: !function local_math_utils.process_results
+generation_kwargs:
+  until:
+    - "Problem:"
+  do_sample: false
+  temperature: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 4
+fewshot_config:
+  sampler: first_n
+  samples: !function local_math_utils.list_fewshot_samples
+metadata:
+  version: 1.0
