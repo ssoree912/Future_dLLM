@@ -11,8 +11,8 @@ TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_FILE:-$REPO/logs/extract_default_teacher_${RUN_TAG}.log}"
 
-DATASETS=(math5s mbpp_full musique gov_report repobench_p)
-LIMITS=(500 371 1600 150 800)
+DATASETS=(math5s mbpp_full gov_report multi_news musique)
+LIMITS=(500 371 150 100 500)
 
 export FUTURE_DLLM_DATA="$DATA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID

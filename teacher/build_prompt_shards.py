@@ -215,6 +215,18 @@ def gov_report(limit):
             for i, row in enumerate(table.itertuples())]
 
 
+def multi_news(limit):
+    """LongBench multi_news 평가 프롬프트를 원본 train 문서로 재현. gen 512 = 16블록."""
+    import pandas as pd
+    table = pd.read_parquet(DATA / "train/multi_news/train.parquet")
+    table = table.sample(frac=1.0, random_state=0).head(limit)
+    return [(f"multinews-{i}",
+             "You are given several news passages. Write a one-page summary of all news. "
+             f"\n\nNews:\n{row.document}\n\nNow, write a one-page summary of all the news."
+             "\n\nSummary:")
+            for i, row in enumerate(table.itertuples())]
+
+
 def math(limit):
     """MATH500은 test에서 뽑은 것이라 train split은 겹치지 않는다."""
     import pandas as pd
@@ -290,12 +302,13 @@ BUILDERS = {"samsum": samsum, "gsm8k": gsm8k, "mmlu": mmlu, "mbpp": mbpp,
             "samsum_lb": samsum_lb, "trec_lb": trec_lb, "wiki2_lb": wiki2_lb,
             "math": math, "mbpp_full": mbpp_full,
             "musique": musique, "qasper": qasper, "gov_report": gov_report,
+            "multi_news": multi_news,
             "math5s": math5s, "math_ho_near": math_ho_near,
             "math_ho_far": math_ho_far, "repobench_p": repobench_p}
 
 # LongBench 계열은 평가 경로가 chat template을 쓰지 않는다.
 RAW_TEXT = {"samsum", "samsum_lb", "trec_lb", "wiki2_lb",
-            "musique", "qasper", "gov_report", "repobench_p"}
+            "musique", "qasper", "gov_report", "multi_news", "repobench_p"}
 
 
 def main():

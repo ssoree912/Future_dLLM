@@ -28,6 +28,7 @@ DATASET_TASK = {
     "musique": "longbench/musique.yaml",
     "qasper": "longbench/qasper.yaml",
     "gov_report": "longbench/gov_report.yaml",
+    "multi_news": "longbench/multi_news.yaml",
     "repobench_p": "longbench/repobench-p.yaml",
     "gsm8k": "local/gsm8k.yaml",
     "math": "local/math.yaml",

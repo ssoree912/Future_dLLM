@@ -39,7 +39,7 @@ sparse_future/
 scripts/download_model.sh
 python scripts/download_data.py
 ```
-필요하면 데이터셋 다운로드를 나눠서 실행할 수 있습니다.
+
 
 ```bash
 python scripts/download_data.py --parts eval
@@ -93,13 +93,13 @@ python teacher/extract_teacher.py     --dataset samsum --n-samples 300
 
 ## 학습
 
-기본 student 는 다음 명령으로 학습합니다.
+default 학습스크립트 
 
 ```bash
 scripts/train_default_student.sh
 ```
 
-개별 구성을 학습
+개별 구성 학습
 
 ```bash
 python student/train_student.py --teacher-root artifacts/teacher/samsum
