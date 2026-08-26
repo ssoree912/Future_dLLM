@@ -1,5 +1,5 @@
 # pip install -r requirements.txt
-# torch is CUDA 12.4: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+# torch is CUDA 12.1: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1
 transformers==4.46.3
 tokenizers==0.20.3
