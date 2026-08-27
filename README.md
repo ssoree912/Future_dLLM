@@ -104,6 +104,7 @@ scripts/train_default_student.sh
 ```bash
 python student/train_student.py --teacher-root artifacts/teacher/samsum
 ```
+sample ckpt : https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip
 
 
 ## 추론
