@@ -5,8 +5,8 @@ Only non-test splits are used so the teacher never sees an evaluation item.
 카테고리별 대표 하나씩. 토픽보다 중요한 축은 캐시에서 프롬프트가 차지하는 비율
 P/(P+32b)이라, 장문(0.9대)과 자기추론(0.2~0.3)의 양 끝을 모두 덮도록 골랐다.
 
-  samsum_lb   장문 요약        LongBench 형식 train, 프롬프트 2048
-  trec_lb     장문 few-shot 분류 LongBench 형식 train, 프롬프트 2048
+  samsum_lb   장문 요약        LongBench 형식 train, 가변 길이 프롬프트
+  trec_lb     장문 few-shot 분류 LongBench 형식 train, 가변 길이 프롬프트
   wiki2_lb    장문 멀티홉 QA    LongBench 형식 train, 프롬프트 ~1000
   math        수학 추론        hendrycks_math train (MATH500은 test에서 나온다)
   mbpp_full   코드            mbpp full train
@@ -18,7 +18,7 @@ drop_middle=False 경로와 동일). 나머지는 평가와 같이 chat template
 
 from __future__ import annotations
 
-import argparse, glob, json, os
+import argparse, glob, json, os, sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +26,9 @@ DATA = Path(os.environ.get("FUTURE_DLLM_DATA", REPO_ROOT / "data"))
 
 import torch
 from transformers import AutoTokenizer
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gen_length import resolve as resolve_gen_length
 
 MATH_INSTRUCTION = ("Please reason step by step, and put your final answer within "
                     "\\boxed{}.")
@@ -316,32 +319,66 @@ def main():
     p.add_argument("--dataset", choices=sorted(BUILDERS), required=True)
     p.add_argument("--limit", type=int, default=300)
     p.add_argument("--model", default=str(REPO_ROOT / "model" / "LLaDA-8B-Instruct"))
+    p.add_argument("--max-seq-len", type=int, default=4096,
+                   help="maximum prompt + generation length (default: 4096)")
+    p.add_argument("--gen-length", type=int, default=None,
+                   help="default: the matching eval task's generation budget")
     p.add_argument("--chat-template", type=int, default=-1,
                    help="-1이면 데이터셋 기본값(LongBench 계열은 끔)")
     p.add_argument("--out-root", default=str(REPO_ROOT / "artifacts" / "prompt_shards"))
     args = p.parse_args()
 
+    if args.max_seq_len < 1:
+        raise SystemExit("--max-seq-len must be positive")
+    if args.gen_length is None:
+        args.gen_length, gen_source = resolve_gen_length(args.dataset)
+    else:
+        gen_source = "--gen-length"
+    if args.gen_length < 1:
+        raise SystemExit("--gen-length must be positive")
+    prompt_limit = args.max_seq_len - args.gen_length
+    if prompt_limit < 1:
+        raise SystemExit(
+            f"generation length {args.gen_length} leaves no prompt space within "
+            f"--max-seq-len {args.max_seq_len}"
+        )
+
     chat = (args.dataset not in RAW_TEXT) if args.chat_template < 0 else bool(args.chat_template)
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    # 평가(lm_eval_model)는 프롬프트 뒤쪽 2048을 유지하므로 teacher도 같은 쪽을 본다.
+    # 평가와 동일하게 총 길이에서 생성 예산을 먼저 확보하고 프롬프트 뒤쪽을 유지한다.
     tok.truncation_side = "left"
     out = Path(args.out_root) / args.dataset
     out.mkdir(parents=True, exist_ok=True)
-    added = 0
+    added = rebuilt = 0
     for sid, text in BUILDERS[args.dataset](args.limit):
-        if (out / f"{sid}.pt").exists():      # raising --limit only adds new samples
-            continue
-        added += 1
+        target = out / f"{sid}.pt"
+        if target.exists():
+            saved = torch.load(target, map_location="cpu", weights_only=False)
+            if (saved.get("max_seq_len") == args.max_seq_len
+                    and saved.get("gen_length") == args.gen_length
+                    and saved.get("prompt_limit") == prompt_limit):
+                continue
+            rebuilt += 1
+        else:
+            added += 1
         if chat:
             text = tok.apply_chat_template([{"role": "user", "content": text}],
                                            add_generation_prompt=True, tokenize=False)
         ids = tok(text, return_tensors="pt", add_special_tokens=not chat,
-                  truncation=True, max_length=2048).input_ids[0]
-        torch.save({"sample_id": sid, "dataset": args.dataset,
-                    "prompt_input_ids": ids.to(torch.long)}, out / f"{sid}.pt")
+                  truncation=True, max_length=prompt_limit).input_ids[0]
+        payload = {"sample_id": sid, "dataset": args.dataset,
+                   "prompt_input_ids": ids.to(torch.long),
+                   "prompt_limit": prompt_limit,
+                   "gen_length": args.gen_length,
+                   "max_seq_len": args.max_seq_len}
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, target)
     n = len(list(out.glob("*.pt")))
-    print(f"{args.dataset}: {n} shards total, {added} new "
-          f"(chat_template={chat}) -> {out}", flush=True)
+    print(f"{args.dataset}: {n} shards total, {added} new, {rebuilt} rebuilt "
+          f"(prompt_limit={prompt_limit}, gen_length={args.gen_length} from "
+          f"{gen_source}, max_seq_len={args.max_seq_len}, chat_template={chat}) "
+          f"-> {out}", flush=True)
     return 0
 
 

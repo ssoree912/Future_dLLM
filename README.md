@@ -70,6 +70,8 @@ python scripts/download_data.py --parts longbench
 ## Teacher 라벨
 
 현재 기본 학습 구성을 처음부터 추출하려면 다음 스크립트를 사용합니다.
+기본 총 시퀀스 길이는 `프롬프트 + 생성 = 최대 4096`이며, 데이터셋별 생성
+길이를 먼저 확보한 나머지를 프롬프트에 사용합니다.
 
 ```bash
 scripts/extract_default_teacher.sh
@@ -87,9 +89,13 @@ scripts/extract_default_teacher.sh
 개별 데이터셋만 추출
 
 ```bash
-python teacher/build_prompt_shards.py --dataset samsum --limit 300
-python teacher/extract_teacher.py     --dataset samsum --n-samples 300
+python teacher/build_prompt_shards.py --dataset samsum --limit 300 --max-seq-len 4096
+python teacher/extract_teacher.py     --dataset samsum --n-samples 300 --max-seq-len 4096
 ```
+
+teacher 추출과 student 학습은 total 4096을 기준으로 합니다. 4096을 넘는
+LongBench 장문 실험은 학습 데이터를 다시 만들지 않고 추론에서만
+`MAX_SEQ_LEN`을 늘립니다.
 
 ## 학습
 
@@ -113,4 +119,13 @@ scripts/run_eval.sh <dataset> <keep_ratio> [checkpoint]
 
 scripts/run_eval.sh samsum 0.1 artifacts/ckpts/1ds_300_e6_lr2e-4_6a5fc6/checkpoint-best
 scripts/run_eval.sh gsm8k  1.0            # 축출 없음, 체크포인트 없음
+
+# 기본은 평가 데이터 전체, LIMIT을 지정한 경우에만 샘플 수 제한
+LIMIT=200 scripts/run_eval.sh math 0.1 artifacts/ckpts/<run>/checkpoint-best
+
+# 기본 총 길이는 4096. 10K LongBench는 추론에서만 선택
+MAX_SEQ_LEN=10240 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/checkpoint-best
+
+# 길이 일반화 비교가 필요하면 프롬프트만의 상한도 별도로 선택
+MAX_SEQ_LEN=4096 MAX_PROMPT_LEN=2048 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/checkpoint-best
 ```

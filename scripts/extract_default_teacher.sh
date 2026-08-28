@@ -8,6 +8,7 @@ MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/LLaDA-8B-Instruct}"
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 PROMPT_ROOT="${PROMPT_ROOT:-$REPO/artifacts/prompt_shards}"
 TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher}"
+MAX_SEQ_LEN=4096
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_FILE:-$REPO/logs/teacher_extract/extract_default_teacher_${RUN_TAG}.log}"
 
@@ -22,8 +23,8 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$(dirname "$LOG_FILE")" "$PROMPT_ROOT" "$TEACHER_ROOT"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-printf 'default teacher extraction\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nlog=%s\n' \
-  "$MODEL" "$DATA_ROOT" "$PROMPT_ROOT" "$TEACHER_ROOT" "$LOG_FILE"
+printf 'default teacher extraction\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nmax_seq_len=%s\nlog=%s\n' \
+  "$MODEL" "$DATA_ROOT" "$PROMPT_ROOT" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "$LOG_FILE"
 
 for index in "${!DATASETS[@]}"; do
   dataset="${DATASETS[$index]}"
@@ -31,6 +32,7 @@ for index in "${!DATASETS[@]}"; do
   "$PY" "$REPO/teacher/build_prompt_shards.py" \
     --dataset "$dataset" \
     --limit "$limit" \
+    --max-seq-len "$MAX_SEQ_LEN" \
     --model "$MODEL" \
     --out-root "$PROMPT_ROOT"
 done
@@ -41,6 +43,7 @@ for index in "${!DATASETS[@]}"; do
   "$PY" "$REPO/teacher/extract_teacher.py" \
     --dataset "$dataset" \
     --n-samples "$limit" \
+    --max-seq-len "$MAX_SEQ_LEN" \
     --model "$MODEL" \
     --shard-root "$PROMPT_ROOT" \
     --output-root "$TEACHER_ROOT"

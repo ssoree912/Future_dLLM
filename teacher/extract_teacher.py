@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import sys
 import time
 from pathlib import Path
@@ -44,14 +45,32 @@ def parse_args():
     p.add_argument("--gen-length", type=int, default=None,
                    help="default: the eval task's max_gen_toks, see teacher/gen_length.py")
     p.add_argument("--block-length", type=int, default=32)
-    p.add_argument("--max-prompt-len", type=int, default=2048)
+    p.add_argument("--max-seq-len", type=int, default=4096,
+                   help="maximum prompt + generation length (default: 4096)")
+    p.add_argument("--max-prompt-len", type=int, default=None,
+                   help="optional stricter prompt-only cap")
     args = p.parse_args()
     if args.gen_length is None:
         args.gen_length, source = resolve_gen_length(args.dataset)
         print(f"gen_length {args.gen_length} from {source}", flush=True)
+    if args.gen_length < 1:
+        raise SystemExit("--gen-length must be positive")
+    if args.block_length < 1:
+        raise SystemExit("--block-length must be positive")
     if args.gen_length % args.block_length:
         raise SystemExit(f"gen_length {args.gen_length} is not a multiple of "
                          f"block_length {args.block_length}")
+    if args.max_seq_len < 1:
+        raise SystemExit("--max-seq-len must be positive")
+    available = args.max_seq_len - args.gen_length
+    if available < 1:
+        raise SystemExit(
+            f"generation length {args.gen_length} leaves no prompt space within "
+            f"--max-seq-len {args.max_seq_len}"
+        )
+    if args.max_prompt_len is not None and args.max_prompt_len < 1:
+        raise SystemExit("--max-prompt-len must be positive")
+    args.prompt_limit = min(available, args.max_prompt_len or available)
     return args
 
 
@@ -60,8 +79,8 @@ def collect(model, prompt_ids, args):
     from future_dllm import CustomCache, add_gumbel_noise, get_num_transfer_tokens
 
     device = model.device
-    # 평가와 같은 left-truncate: 프롬프트가 길면 뒤쪽을 유지한다.
-    prompt_ids = prompt_ids[-args.max_prompt_len:].to(device).unsqueeze(0)
+    # 평가와 같은 left-truncate: 총 길이 안에서 생성 공간을 먼저 확보한다.
+    prompt_ids = prompt_ids[-args.prompt_limit:].to(device).unsqueeze(0)
     P = prompt_ids.shape[1]
     G, B = args.gen_length, args.block_length
     n_blocks = G // B
@@ -134,6 +153,11 @@ def main():
     from future_dllm import LLaDAModelLM
 
     cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    native_limit = int(getattr(cfg, "max_sequence_length", args.max_seq_len))
+    if args.max_seq_len > native_limit:
+        print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
+              f"trained context {native_limit}", flush=True)
+    cfg.max_sequence_length = args.max_seq_len
     cfg.block_len, cfg.keep_ratio = args.block_length, 1.0
     model = LLaDAModelLM.from_pretrained(args.model, config=cfg, device_map="auto",
                                          torch_dtype=torch.bfloat16,
@@ -148,18 +172,36 @@ def main():
     started, added = time.time(), 0
     for i, path in enumerate(shards):
         target = out / Path(path).name
-        # Labels accumulate: an interrupted run resumes, and raising --n-samples
-        # only extracts the samples that are not there yet.
-        if target.exists():
-            continue
-        added += 1
         src = torch.load(path, map_location="cpu", weights_only=False)
-        records = collect(model, src["prompt_input_ids"].to(torch.long), args)
-        torch.save({"sample_id": src.get("sample_id"),
-                    "dataset": args.dataset,
-                    "prompt_input_ids": src["prompt_input_ids"].to(torch.long),
-                    "teacher_kind": "final_rowmax",
-                    "blocks": records}, target)
+        prompt_ids = src["prompt_input_ids"].to(torch.long)
+        expected_prompt_len = min(prompt_ids.numel(), args.prompt_limit)
+
+        # Resume only when the saved labels match the requested sequence shape.
+        # Old 2048 labels are therefore rebuilt after their prompt shards grow.
+        if target.exists():
+            saved = torch.load(target, map_location="cpu", weights_only=False)
+            blocks = saved.get("blocks") or []
+            if (blocks
+                    and all(int(r.get("prompt_length", -1)) == expected_prompt_len
+                            and int(r.get("gen_length", -1)) == args.gen_length
+                            and r["x_at_block_start"].numel()
+                            == expected_prompt_len + args.gen_length
+                            for r in blocks)):
+                continue
+            print(f"rebuilding mismatched teacher shard: {target.name}", flush=True)
+        added += 1
+        records = collect(model, prompt_ids, args)
+        payload = {"sample_id": src.get("sample_id"),
+                   "dataset": args.dataset,
+                   "prompt_input_ids": prompt_ids,
+                   "prompt_limit": args.prompt_limit,
+                   "gen_length": args.gen_length,
+                   "max_seq_len": args.max_seq_len,
+                   "teacher_kind": "final_rowmax",
+                   "blocks": records}
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        torch.save(payload, temporary)
+        os.replace(temporary, target)
         if (i + 1) % 10 == 0:
             print(f"{i + 1}/{len(shards)}  {(time.time() - started) / (i + 1):.1f}s/sample",
                   flush=True)
