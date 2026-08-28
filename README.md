@@ -105,7 +105,6 @@ scripts/train_default_student.sh
 python student/train_student.py --teacher-root artifacts/teacher/samsum
 ```
 
-
 ## 추론
 
 ```bash
@@ -114,3 +113,4 @@ scripts/run_eval.sh <dataset> <keep_ratio> [checkpoint]
 scripts/run_eval.sh samsum 0.1 artifacts/ckpts/1ds_300_e6_lr2e-4_6a5fc6/checkpoint-best
 scripts/run_eval.sh gsm8k  1.0            # 축출 없음, 체크포인트 없음
 ```
+*발표자료에서 보여드렸던 훈련셋을 다르게 구성하여 발표자료랑 성능이 동일하지 않습니다.
