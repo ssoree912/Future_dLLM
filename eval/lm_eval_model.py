@@ -61,7 +61,8 @@ class LLaDAFuture(HFLM):
         pretrained: str = str(DEFAULT_MODEL),
         keep_ratio: float = 1.0,
         block_len: int = 32,
-        max_prompt_len: int = 2048,
+        max_seq_len: int = 4096,
+        max_prompt_len: int = 0,
         student_path: str = "",
         dtype: str = "bfloat16",
         diffusion_steps: int = 32,
@@ -76,7 +77,8 @@ class LLaDAFuture(HFLM):
 
         self._generate = generate
         self._block_len = int(block_len)
-        self._max_prompt_len = int(max_prompt_len)
+        self._max_seq_len = int(max_seq_len)
+        self._max_prompt_len = int(max_prompt_len) or self._max_seq_len
         self._keep_ratio = float(keep_ratio)
         self._diffusion_steps = int(diffusion_steps)
         self._sampling_eps = float(sampling_eps)
@@ -86,8 +88,10 @@ class LLaDAFuture(HFLM):
 
         if not 0.0 < self._keep_ratio <= 1.0:
             raise ValueError("keep_ratio must be in (0, 1]")
-        if self._max_prompt_len < 1:
-            raise ValueError("max_prompt_len must be positive")
+        if self._max_seq_len < 1:
+            raise ValueError("max_seq_len must be positive")
+        if int(max_prompt_len) < 0:
+            raise ValueError("max_prompt_len must be non-negative")
         if self._diffusion_steps < 1:
             raise ValueError("diffusion_steps must be positive")
         if not 0.0 < self._sampling_eps <= 1.0:
@@ -99,6 +103,11 @@ class LLaDAFuture(HFLM):
             )
 
         config = AutoConfig.from_pretrained(str(pretrained), trust_remote_code=True)
+        native_limit = int(getattr(config, "max_sequence_length", self._max_seq_len))
+        if self._max_seq_len > native_limit:
+            print(f"warning: max_seq_len={self._max_seq_len} exceeds the checkpoint's "
+                  f"trained context {native_limit}", flush=True)
+        config.max_sequence_length = self._max_seq_len
         config.block_len = int(block_len)
         config.keep_ratio = float(keep_ratio)
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -131,7 +140,8 @@ class LLaDAFuture(HFLM):
                 "eviction needs a trained scorer: pass student_path=<checkpoint>, "
                 "or keep_ratio=1.0 to run without eviction")
         print(f"[LLaDA_future] keep_ratio={keep_ratio} block_len={block_len} "
-              f"max_prompt_len={max_prompt_len} "
+              f"max_seq_len={self._max_seq_len} "
+              f"max_prompt_len={self._max_prompt_len} "
               f"scorer={student_path or 'none (no eviction)'}", flush=True)
 
     @property
@@ -154,12 +164,17 @@ class LLaDAFuture(HFLM):
         if self.tokenizer.eos_token_id is not None:
             target.append(int(self.tokenizer.eos_token_id))
 
-        model_limit = int(getattr(self.model.config, "max_sequence_length", self.max_length))
-        if len(target) >= model_limit:
+        reserved_target = len(target)
+        if self._keep_ratio < 1.0:
+            reserved_target = (
+                (reserved_target + self._block_len - 1) // self._block_len
+            ) * self._block_len
+        if reserved_target >= self._max_seq_len:
             raise ValueError(
-                f"continuation has {len(target)} tokens, exceeding model limit {model_limit}"
+                f"continuation needs {reserved_target} tokens, exceeding "
+                f"max_seq_len {self._max_seq_len}"
             )
-        prefix_limit = min(self._max_prompt_len, model_limit - len(target))
+        prefix_limit = min(self._max_prompt_len, self._max_seq_len - reserved_target)
         prefix = prefix[-prefix_limit:]
         if not prefix:
             prefix = [int(self.prefix_token_id)]
@@ -360,9 +375,15 @@ class LLaDAFuture(HFLM):
 
             if self.add_bos_token:
                 context = self.tokenizer.bos_token + context
+            prompt_limit = min(self._max_prompt_len, self._max_seq_len - gen_length)
+            if prompt_limit < 1:
+                raise ValueError(
+                    f"generation length {gen_length} leaves no prompt space "
+                    f"within max_seq_len {self._max_seq_len}"
+                )
             context_enc, _ = self.tok_batch_encode(
                 [context], truncation=self.truncation,
-                left_truncate_len=self._max_prompt_len)
+                left_truncate_len=prompt_limit)
 
             out = self._call_generate(context_enc, gen_kwargs, gen_length)
             text = self.tokenizer.decode(out[0, context_enc.shape[1]:],

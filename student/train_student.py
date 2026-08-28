@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--mlp-dim", type=int, default=512)
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--pairs", type=int, default=4096)
+    p.add_argument("--max-seq-len", type=int, default=4096,
+                   help="reject teacher records longer than this total sequence length")
     p.add_argument("--lambda-list", type=float, default=1.0,
                    help="weight on the listwise KL against the pairwise term")
     p.add_argument("--seed", type=int, default=0)
@@ -90,12 +92,19 @@ def load_shard(path, attempts=3):
 
 def main():
     args = parse_args()
+    if args.max_seq_len < 1:
+        raise SystemExit("--max-seq-len must be positive")
     torch.manual_seed(args.seed); random.seed(args.seed)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from transformers import AutoConfig
     from future_dllm import LLaDAModelLM, CustomCache
 
     cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    native_limit = int(getattr(cfg, "max_sequence_length", args.max_seq_len))
+    if args.max_seq_len > native_limit:
+        print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
+              f"trained context {native_limit}", flush=True)
+    cfg.max_sequence_length = args.max_seq_len
     cfg.block_len, cfg.keep_ratio = 32, 1.0
     model = LLaDAModelLM.from_pretrained(args.model, config=cfg, device_map="auto",
                                          torch_dtype=torch.bfloat16,
@@ -151,6 +160,7 @@ def main():
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
                "val_ratio": args.val_ratio, "pairs": args.pairs,
+               "max_seq_len": args.max_seq_len,
                "lambda_list": args.lambda_list,
                "teacher_roots": roots,
                "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
@@ -158,6 +168,12 @@ def main():
 
     @torch.no_grad()
     def features(record):
+        sequence_length = int(record["x_at_block_start"].numel())
+        if sequence_length > args.max_seq_len:
+            raise RuntimeError(
+                f"teacher record total length {sequence_length} exceeds "
+                f"--max-seq-len {args.max_seq_len}; use a matching student limit"
+            )
         x = record["x_at_block_start"].unsqueeze(0).to(device)
         cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
         cache.layer_hidden_states = {}

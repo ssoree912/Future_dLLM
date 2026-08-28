@@ -371,7 +371,6 @@ def main() -> int:
     if "longbench" in args.parts:
         download_longbench(root)
     print(f"datasets written under {root}")
-    print("Manual upstream-only sources still needed for exact LongBench-source training: SAMSum, TREC, QMSum.")
     return 0
 
 

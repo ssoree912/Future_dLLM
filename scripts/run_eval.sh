@@ -6,6 +6,7 @@
 # Examples:
 #   scripts/run_eval.sh samsum 0.1 artifacts/ckpts/<run>/checkpoint-best
 #   scripts/run_eval.sh gsm8k  1.0
+#   LIMIT=200 scripts/run_eval.sh math 0.1 artifacts/ckpts/<run>/checkpoint-best
 set -euo pipefail
 
 DATASET="${1:?usage: run_eval.sh <dataset> <keep_ratio> [checkpoint]}"
@@ -46,7 +47,11 @@ if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ]; then
 fi
 
 MODEL_NAME=LLaDA_future
-ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_prompt_len=${MAX_PROMPT_LEN:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_seq_len=$MAX_SEQ_LEN"
+if [ -n "${MAX_PROMPT_LEN:-}" ]; then
+  ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"
+fi
 if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   ARGS="$ARGS,diffusion_steps=${NLL_SAMPLES:-32}"
 fi
@@ -72,7 +77,8 @@ for y in "$REPO"/eval/tasks/local/*.yaml "$REPO"/eval/tasks/local_mc/*; do
   sed "s|DATA_DIR|$DATA_ROOT|" "$y" > "$TASKS_DIR/$(basename "$y")"
 done
 
-export FUTURE_DLLM_RESUME="$REPO/results/.resume/${MODEL_TAG}_${DATASET}_keep${KEEP}_${METHOD}_$(printf %s "$ARGS" | md5sum | cut -c1-8).jsonl"
+RESUME_KEY="$(printf '%s\n%s' "$ARGS" "${LIMIT:-all}" | md5sum | cut -c1-8)"
+export FUTURE_DLLM_RESUME="$REPO/results/.resume/${MODEL_TAG}_${DATASET}_keep${KEEP}_${METHOD}_${RESUME_KEY}.jsonl"
 mkdir -p "$(dirname "$FUTURE_DLLM_RESUME")"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -86,6 +92,10 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
 
 EXTRA_ARGS=()
+LIMIT_ARGS=()
+if [ -n "${LIMIT:-}" ]; then
+  LIMIT_ARGS+=(--limit "$LIMIT")
+fi
 if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   EXTRA_ARGS+=(--apply_chat_template)
 fi
@@ -94,14 +104,15 @@ if [ "$UNSAFE_TASK" -eq 1 ]; then
   EXTRA_ARGS+=(--confirm_run_unsafe_code)
 fi
 
-echo "$DATASET keep=$KEEP -> $RESULT"
+echo "$DATASET keep=$KEEP max_seq_len=$MAX_SEQ_LEN samples=${LIMIT:-all} -> $RESULT"
 cd "$REPO"
 "$PY" eval/run.py \
   --model "$MODEL_NAME" \
   --model_args "$ARGS" \
   --tasks "$TASK" ${SHOTS} \
   --include_path "$TASKS_DIR" \
-  --limit "${LIMIT:-200}" --batch_size 1 \
+  --batch_size 1 \
+  "${LIMIT_ARGS[@]}" \
   "${EXTRA_ARGS[@]}" \
   --output_path "$TMP/out"
 
