@@ -46,7 +46,7 @@ if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ]; then
 fi
 
 MODEL_NAME=LLaDA_future
-ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP"
+ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_prompt_len=${MAX_PROMPT_LEN:-4096}"
 if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   ARGS="$ARGS,diffusion_steps=${NLL_SAMPLES:-32}"
 fi
