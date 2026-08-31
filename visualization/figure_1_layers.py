@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-input", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--layers", default="4,15,31",
+    parser.add_argument("--layers", default="4,15,24",
                         help="comma-separated zero-based layer indices")
     parser.add_argument("--block-index", type=int, default=4)
     budget = parser.add_mutually_exclusive_group()
@@ -218,7 +218,8 @@ def render_layer_grid(
         colorbar.ax.tick_params(labelsize=7, length=2)
         colorbar.set_label("Actual completed-answer attention retained after eviction",
                            fontsize=8)
-    return _save(figure, output_dir, "figure_1_layers_04_15_31")
+    layer_suffix = "_".join(f"{layer:02d}" for layer in layers)
+    return _save(figure, output_dir, f"figure_1_layers_{layer_suffix}")
 
 
 def render_layer_average(

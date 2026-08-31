@@ -99,7 +99,7 @@ python visualization/figure_1_layers.py \
   --analysis-input artifacts/figure_1_gsm8k_16/analysis_r015/analysis.pt \
   --keep-ratio 0.1 \
   --block-index 4 \
-  --layers 4,15,31 \
+  --layers 4,15,24 \
   --output-dir artifacts/figure_1_gsm8k_16/layer_grid_r010
 ```
 
