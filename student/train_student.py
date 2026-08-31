@@ -35,7 +35,7 @@ def parse_args():
                    help="default: artifacts/ckpts/<auto name>, see checkpoint_name()")
     p.add_argument("--name", default="",
                    help="override just the directory name under artifacts/ckpts")
-    p.add_argument("--epochs", type=int, default=6)
+    p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--proj-dim", type=int, default=256)
     p.add_argument("--mlp-dim", type=int, default=512)
