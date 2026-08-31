@@ -73,6 +73,10 @@ def parse_args() -> argparse.Namespace:
         "--qualitative-scope", choices=("all", "prompt"), default="all",
         help="candidate columns shown; metrics always use the full candidate pool",
     )
+    parser.add_argument(
+        "--reference-label", choices=("gt", "future"), default="gt",
+        help="terminology used for the completed-LLaDA-attention reference",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -102,7 +106,7 @@ def topk_metrics(
     future_score: torch.Tensor,
     cache_budget: int,
 ) -> tuple[torch.Tensor, float, float]:
-    """Return kept indices, Future-Mass@K, and Future-Recall@K."""
+    """Return kept indices, Future-Mass@K, and GT-Recall@K."""
     predicted_score = predicted_score.flatten().float()
     future_score = future_score.flatten().float()
     if predicted_score.shape != future_score.shape:
@@ -784,6 +788,7 @@ def render_figure(
         1.0,
         float(block["ours_recall_at_k"][layer]),
     )
+    reference_label = "GT" if args.reference_label == "gt" else "Future"
     retention_colors = ["#4C78A8", "#5B4B8A", "#1B9E77"]
 
     figure = plt.figure(figsize=(16.6, 5.35), constrained_layout=False)
@@ -832,7 +837,7 @@ def render_figure(
             ["0", str(display_candidate_count - 1)], fontsize=7.5,
         )
         axis.text(
-            0.5, 1.145, f"GT Top-K overlap: {recall:.1%}",
+            0.5, 1.145, f"{reference_label} Top-K overlap: {recall:.1%}",
             transform=axis.transAxes, ha="center", va="bottom", fontsize=8.0,
             color="#30343B", fontweight="semibold", clip_on=False,
         )
@@ -934,7 +939,9 @@ def render_figure(
         x + width / 2, [mass_ours, recall_ours], width,
         color="#1B9E77", label="Ours"
     )
-    metric_axis.set_xticks(x, ["Future-\nMass@K", "Future-\nRecall@K"])
+    metric_axis.set_xticks(
+        x, ["Future-\nMass@K", f"{reference_label}-\nRecall@K"]
+    )
     metric_axis.set_ylim(0.0, 1.05)
     metric_axis.set_ylabel("Score (higher is better)")
     metric_axis.grid(axis="y", color="#D8DCE3", linewidth=0.65, alpha=0.8)
@@ -1007,6 +1014,7 @@ def render_figure(
         "qualitative_layer_index": layer,
         "summary_granularity": args.summary_granularity,
         "qualitative_scope": args.qualitative_scope,
+        "reference_label": args.reference_label,
         "future_display_rows": len(future_row_labels),
         "candidate_count": candidate_count,
         "display_candidate_count": display_candidate_count,

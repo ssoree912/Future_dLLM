@@ -13,7 +13,7 @@
   student 점수입니다.
 
 기본 정성 패널은 미리 고정한 layer index 24와 두 번째 generation block을
-사용합니다. 오른쪽 Mass@K/Recall@K는 해당 샘플의 모든 layer와 모든 block을
+사용합니다. 오른쪽 Future-Mass@K/GT-Recall@K는 해당 샘플의 모든 layer와 모든 block을
 평균합니다. `--keep-ratio 0.1`이면 후보 수의 10%를 Top-K budget으로 사용하며,
 오른쪽 점선 `Full cache (1.0)`을 기준으로 그 작은 캐시에 미래 attention mass와
 oracle Top-K가 얼마나 남는지 보여줍니다. 정수 K를 내림하므로 실제 유지 비율은
@@ -39,7 +39,7 @@ activation용으로 남기고 일부 model layer를 CPU에 배치합니다. 전�
 - `figure_1.png`, `figure_1.pdf`: 논문용 정성/정량 패널
 - `analysis.pt`: current score, token별 future attention, row-max oracle,
   prediction, 세 Top-K 집합을 포함한 원자료
-- `metrics.csv`: block/layer별 Mass@K와 Recall@K
+- `metrics.csv`: block/layer별 Future-Mass@K와 GT-Recall@K
 - `summary.json`: 전체 평균과 선택한 정성 패널의 수치
 
 ## MultiNews paper figure
@@ -88,6 +88,10 @@ python visualization/figure_1.py \
   --layer 24 \
   --block-index 1
 ```
+
+완성된 LLaDA block에서 관측한 attention을 미래 사용량이라는 관점으로 표현할
+때는 `--reference-label future`를 사용합니다. 계산은 GT 표기 버전과 같고,
+그림의 `GT Top-K overlap/Recall@K`만 `Future Top-K overlap/Recall@K`로 바뀝니다.
 
 ## Multi-layer and layer-average export
 
