@@ -56,19 +56,19 @@ python visualization/figure_1.py \
   --student artifacts/ckpts/<run>/checkpoint-best \
   --layer 24 \
   --block-index 7 \
-  --keep-ratio 0.1 \
+  --keep-ratio 0.15 \
   --summary-granularity token \
-  --qualitative-scope prompt \
-  --output-dir artifacts/figure_1_multinews_77/retained_attention_token
+  --qualitative-scope all \
+  --output-dir artifacts/figure_1_multinews_77/all_topk_r015
 ```
 
 세 heatmap은 모두 같은 full-cache `future_attention_rows`에서 시작합니다.
-각각 Sparse-dLLM, `label_final_rowmax` oracle, ours가 선택한 global Top-10%
-열만 남기고 나머지 열을 0으로 만들어, 실제 future attention 중 각 eviction
-방법이 보존한 부분을 같은 color scale로 비교합니다. 위의 가는 띠는 각 방법이
-남긴 cache 위치입니다. `prompt` scope는 정성 heatmap만 기사 영역으로
-crop합니다. Top-K 선택과 오른쪽 Mass/Recall은 여전히 prompt, previous summary,
-future masked summary가 경쟁하는 전체 cache candidate pool에서 계산합니다.
+각각 Sparse-dLLM, `label_final_rowmax` oracle, ours가 선택한 global Top-K 열을
+표시하고, heatmap 밝기는 선택된 열에서 실제 future attention 크기만을
+나타냅니다. 위의 굵은 binary 띠에는 attention 크기와 무관하게 각 방법이 남긴
+모든 Top-K 위치가 표시됩니다. `all` scope에서는 prompt, previous summary,
+future masked summary가 경쟁하는 전체 candidate pool을 그대로 표시하며,
+오른쪽 Mass/Recall도 같은 pool에서 계산합니다.
 
 `sentence`를 사용하면 completed answer token 행을 sentence-wise max로 줄일 수
 있지만, Sparse-dLLM 논문의 query-token × key-token attention map과 같은 형태의

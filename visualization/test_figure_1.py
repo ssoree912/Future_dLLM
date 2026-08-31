@@ -100,6 +100,5 @@ class FigureMetricsTest(unittest.TestCase):
             [0.0, 0.6, 0.0, 0.8],
         ]))
 
-
 if __name__ == "__main__":
     unittest.main()

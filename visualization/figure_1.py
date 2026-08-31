@@ -715,7 +715,6 @@ def render_figure(
     })
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap, PowerNorm
-    from matplotlib.ticker import MaxNLocator
 
     if args.block_index >= len(payload["blocks"]):
         raise SystemExit(
@@ -762,11 +761,6 @@ def render_figure(
     current_keep = block["current_keep"][layer]
     oracle_keep = block["oracle_keep"][layer]
     ours_keep = block["ours_keep"][layer]
-    heatmaps = [
-        mask_future_attention(comparison_rows, keep)[..., display_slice]
-        .detach().float().cpu().numpy()
-        for keep in (current_keep, oracle_keep, ours_keep)
-    ]
     unmasked_future = comparison_rows[..., display_slice].detach().float().cpu().numpy()
     finite_future = unmasked_future[np.isfinite(unmasked_future)]
     positive_future = finite_future[finite_future > 0]
@@ -775,7 +769,15 @@ def render_figure(
         color_max = max(color_max, float(positive_future.min()))
     else:
         color_max = 1.0
-    attention_norm = PowerNorm(gamma=0.40, vmin=0.0, vmax=color_max, clip=True)
+    power_gamma = 0.40
+    heatmaps = [
+        mask_future_attention(comparison_rows, keep)[..., display_slice]
+        .detach().float().cpu().numpy()
+        for keep in (current_keep, oracle_keep, ours_keep)
+    ]
+    attention_norm = PowerNorm(
+        gamma=power_gamma, vmin=0.0, vmax=color_max, clip=True
+    )
 
     selected_recall = (
         float(block["current_recall_at_k"][layer]),
@@ -802,7 +804,12 @@ def render_figure(
             values, aspect="auto", interpolation="nearest", cmap="viridis",
             norm=attention_norm, origin="upper",
         )
-        axis.set_xlabel("Prompt key position", fontsize=8.5, labelpad=6)
+        x_axis_label = (
+            "Prompt key position"
+            if args.qualitative_scope == "prompt"
+            else "Cache candidate position"
+        )
+        axis.set_xlabel(x_axis_label, fontsize=8.5, labelpad=6)
         if panel_index == 0:
             axis.set_ylabel(future_ylabel, fontsize=9.0, labelpad=7)
         else:
@@ -837,7 +844,7 @@ def render_figure(
 
         keep_mask = np.zeros(candidate_count, dtype=np.uint8)
         keep_mask[np.asarray(keep, dtype=np.int64)] = 1
-        mask_axis = axis.inset_axes([0.0, 1.018, 1.0, 0.035])
+        mask_axis = axis.inset_axes([0.0, 1.018, 1.0, 0.060])
         mask_axis.imshow(
             keep_mask[display_slice][None, :], aspect="auto",
             interpolation="nearest",
@@ -862,6 +869,26 @@ def render_figure(
                     transform=axis.get_xaxis_transform(), ha="center", va="bottom",
                     fontsize=7.0, color="#3F4650", clip_on=False,
                 )
+            if args.qualitative_scope == "all":
+                tail_labels = {
+                    "Previously completed blocks": "Prev.",
+                    "Future masked blocks": "Fut.",
+                }
+                for region in display_regions:
+                    if region["name"] not in tail_labels:
+                        continue
+                    start, end = int(region["start"]), int(region["end"])
+                    axis.axvline(
+                        start - 0.5, color="white", linewidth=0.65,
+                        linestyle=(0, (2, 2)), alpha=0.90,
+                    )
+                    axis.text(
+                        (start + end - 1) / 2, 1.085,
+                        tail_labels[region["name"]],
+                        transform=axis.get_xaxis_transform(), ha="center",
+                        va="bottom", fontsize=5.8, color="#3F4650",
+                        clip_on=False,
+                    )
         else:
             for region in display_regions:
                 start, end = int(region["start"]), int(region["end"])
@@ -883,8 +910,7 @@ def render_figure(
             "(shared scale)",
             fontsize=8.2,
         )
-        colorbar.locator = MaxNLocator(nbins=4)
-        colorbar.update_ticks()
+        colorbar.set_ticks(np.linspace(0.0, color_max, 4))
         colorbar.ax.tick_params(labelsize=7, length=2)
 
     mass_current = float(np.mean([row["current_mass_at_k"] for row in metric_rows]))
@@ -983,11 +1009,11 @@ def render_figure(
         "display_candidate_count": display_candidate_count,
         "heatmap_definition": (
             "full-cache future_attention_rows multiplied by each method's global "
-            "Top-K retention mask"
+            "Top-K retention mask; the separate strip shows every selected entry"
         ),
         "attention_color_scale": {
             "shared_across_panels": True,
-            "power_gamma": 0.40,
+            "power_gamma": power_gamma,
             "vmax_quantile": 0.995,
             "vmax": color_max,
         },
