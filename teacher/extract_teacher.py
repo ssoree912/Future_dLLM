@@ -49,6 +49,11 @@ def parse_args():
                    help="maximum prompt + generation length (default: 4096)")
     p.add_argument("--max-prompt-len", type=int, default=None,
                    help="optional stricter prompt-only cap")
+    p.add_argument(
+        "--save-attention-rows",
+        action="store_true",
+        help="analysis only: also save completed-block attention before row-max",
+    )
     args = p.parse_args()
     if args.gen_length is None:
         args.gen_length, source = resolve_gen_length(args.dataset)
@@ -126,13 +131,24 @@ def collect(model, prompt_ids, args):
         # One more forward on the completed block: all rows are real tokens now.
         cache.capture_rows = True
         step(S - 1)
-        label = torch.stack([cache.pending_rows[l].max(dim=0).values for l in range(L)])
+        save_attention_rows = getattr(args, "save_attention_rows", False)
+        if save_attention_rows:
+            future_attention_rows = torch.stack(
+                [cache.pending_rows[l].clone() for l in range(L)]
+            )
+            label = future_attention_rows.max(dim=1).values
+        else:
+            # Keep the ordinary teacher path at its original memory footprint.
+            label = torch.stack([
+                cache.pending_rows[layer].max(dim=0).values
+                for layer in range(L)
+            ])
         cache.pending_rows.clear()
         cache.capture_rows = False
 
         candidates = torch.cat([torch.arange(bs, device=device),
                                 torch.arange(be, x.shape[1], device=device)])
-        records.append({
+        record = {
             "block_index": block,
             "block_start": int(bs),
             "block_length": B,
@@ -142,7 +158,15 @@ def collect(model, prompt_ids, args):
             "x_at_block_start": x_at_block_start[0].cpu(),
             "candidate_indices": candidates.cpu(),
             "label_final_rowmax": label.to(torch.float16).cpu(),
-        })
+        }
+        if save_attention_rows:
+            # Deliberately analysis-only: [layer, answer token, candidate] is
+            # much larger than the row-max target used to train the student.
+            record["future_attention_rows"] = (
+                future_attention_rows.to(torch.float16).cpu()
+            )
+            record["completed_block_ids"] = x[0, bs:be].cpu()
+        records.append(record)
     return records
 
 
@@ -186,6 +210,8 @@ def main():
                             and int(r.get("gen_length", -1)) == args.gen_length
                             and r["x_at_block_start"].numel()
                             == expected_prompt_len + args.gen_length
+                            and (not args.save_attention_rows
+                                 or "future_attention_rows" in r)
                             for r in blocks)):
                 continue
             print(f"rebuilding mismatched teacher shard: {target.name}", flush=True)
@@ -198,6 +224,7 @@ def main():
                    "gen_length": args.gen_length,
                    "max_seq_len": args.max_seq_len,
                    "teacher_kind": "final_rowmax",
+                   "attention_rows_saved": args.save_attention_rows,
                    "blocks": records}
         temporary = target.with_suffix(target.suffix + ".tmp")
         torch.save(payload, temporary)

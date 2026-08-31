@@ -527,6 +527,58 @@ def alibi_attention_bias(seq_len: int, config: ModelConfig, device: torch.device
 
 ## Future-attention cache eviction
 
+
+def sparse_dllm_current_score(
+    q_block: torch.Tensor,
+    candidate_k: torch.Tensor,
+    pool_kernel_size: Optional[int] = 3,
+) -> torch.Tensor:
+    """Sparse-dLLM's selection-time score for each candidate cache entry.
+
+    The reference baseline first averages the current-block queries over the
+    token rows, takes their dot product with every candidate key, averages over
+    attention heads, and optionally applies stride-1 local max pooling.  It does
+    not softmax or scale the dot products before ranking.
+
+    Args:
+        q_block: ``[batch, query_heads, block_length, head_dim]``.
+        candidate_k: ``[batch, kv_heads, candidates, head_dim]``.
+        pool_kernel_size: Positive odd pooling width, or ``None`` to disable it.
+
+    Returns:
+        A ``[batch, candidates]`` tensor in candidate-cache order.
+    """
+    if q_block.ndim != 4 or candidate_k.ndim != 4:
+        raise ValueError("q_block and candidate_k must both be rank-4 tensors")
+    if q_block.size(0) != candidate_k.size(0):
+        raise ValueError("q_block and candidate_k batch sizes do not match")
+    if q_block.size(-1) != candidate_k.size(-1):
+        raise ValueError("q_block and candidate_k head dimensions do not match")
+    if q_block.size(1) != candidate_k.size(1):
+        if q_block.size(1) % candidate_k.size(1):
+            raise ValueError("query heads must be divisible by KV heads")
+        candidate_k = candidate_k.repeat_interleave(
+            q_block.size(1) // candidate_k.size(1), dim=1
+        )
+
+    average_query = q_block.mean(dim=-2)
+    scores = torch.matmul(
+        average_query.unsqueeze(-2), candidate_k.transpose(-2, -1)
+    ).squeeze(-2)
+    importance = scores.mean(dim=1)
+
+    if pool_kernel_size is not None:
+        if pool_kernel_size < 1 or pool_kernel_size % 2 == 0:
+            raise ValueError("pool_kernel_size must be a positive odd integer or None")
+        importance = F.max_pool1d(
+            importance.unsqueeze(1),
+            kernel_size=pool_kernel_size,
+            stride=1,
+            padding=pool_kernel_size // 2,
+        ).squeeze(1)
+    return importance
+
+
 class CustomCache:
     """Block-wise KV cache with future-attention eviction.
 
@@ -550,12 +602,21 @@ class CustomCache:
         cache_scorer=None,
         prompt_length: int = 0,
         generation_length: int = 0,
+        capture_current_scores: bool = False,
+        current_score_pool_kernel: Optional[int] = 3,
     ) -> None:
         self.cache = {}
         self.keep_ratios = [keep_ratio for _ in range(n_layers)]
         self.cache_scorer = cache_scorer
         self.prompt_length = prompt_length
         self.generation_length = generation_length
+
+        # Figure/analysis-only Sparse-dLLM baseline captured at the exact cache
+        # selection forward. Disabled during ordinary teacher and deployment
+        # runs, so it adds no matmul or retained tensors there.
+        self.capture_current_scores = capture_current_scores
+        self.current_score_pool_kernel = current_score_pool_kernel
+        self.current_scores = {}
 
         # Hidden states the student scores from; the block writes them per layer
         # on the step-1 forward and filter_cache consumes them.
@@ -613,6 +674,11 @@ class CustomCache:
                             cached_k[:, :, cur_filtered_len + block_len:, :]], dim=2)
         keep_v = torch.cat([cached_v[:, :, :cur_filtered_len, :],
                             cached_v[:, :, cur_filtered_len + block_len:, :]], dim=2)
+
+        if self.capture_current_scores:
+            self.current_scores[layer_id] = sparse_dllm_current_score(
+                q_block, keep_k, self.current_score_pool_kernel
+            ).detach()
 
         if self.collect_pool or self.keep_ratios[layer_id] >= 1.0:
             # Nothing is evicted: keep the pool in candidate order so recorded
