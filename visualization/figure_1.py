@@ -832,11 +832,9 @@ def render_figure(
             ["0", str(display_candidate_count - 1)], fontsize=7.5,
         )
         axis.text(
-            0.975, 0.965, f"GT overlap@K: {recall:.1%}",
-            transform=axis.transAxes, ha="right", va="top", fontsize=7.5,
-            color="white",
-            bbox={"boxstyle": "round,pad=0.22", "facecolor": "#171923",
-                  "edgecolor": "none", "alpha": 0.72},
+            0.5, 1.145, f"GT Top-K overlap: {recall:.1%}",
+            transform=axis.transAxes, ha="center", va="bottom", fontsize=8.0,
+            color="#30343B", fontweight="semibold", clip_on=False,
         )
         for spine in axis.spines.values():
             spine.set_color("#7E8490")
@@ -890,12 +888,17 @@ def render_figure(
                         clip_on=False,
                     )
         else:
+            short_region_names = {
+                "Previously completed blocks": "Prev.",
+                "Future masked blocks": "Future",
+            }
             for region in display_regions:
                 start, end = int(region["start"]), int(region["end"])
                 axis.axvline(start - 0.5, color="white", linewidth=0.55,
                             linestyle=(0, (2, 2)), alpha=0.80)
                 axis.text(
-                    (start + end - 1) / 2, 1.085, region["name"],
+                    (start + end - 1) / 2, 1.085,
+                    short_region_names.get(region["name"], region["name"]),
                     transform=axis.get_xaxis_transform(), ha="center", va="bottom",
                     fontsize=6.8, color="#3F4650", clip_on=False,
                 )
