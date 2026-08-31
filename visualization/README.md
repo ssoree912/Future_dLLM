@@ -89,6 +89,24 @@ python visualization/figure_1.py \
   --block-index 1
 ```
 
+## Multi-layer and layer-average export
+
+저장된 `analysis.pt`에서 early/middle/late layer 3개 × 방법 3개의 9-panel
+heatmap과 전체 layer 평균 heatmap을 동시에 만들 수 있습니다.
+
+```bash
+python visualization/figure_1_layers.py \
+  --analysis-input artifacts/figure_1_gsm8k_16/analysis_r015/analysis.pt \
+  --keep-ratio 0.1 \
+  --block-index 4 \
+  --layers 4,15,31 \
+  --output-dir artifacts/figure_1_gsm8k_16/layer_grid_r010
+```
+
+평균 파일은 layer score를 먼저 평균하지 않습니다. 각 layer의 고유 Top-K를
+그 layer의 future attention에 적용한 뒤 retained attention을 layer 방향으로
+평균합니다. 평균 heatmap 위의 띠는 candidate별 layer 선택 빈도입니다.
+
 Teacher shard에 token별 행까지 임시로 보관해야 하는 별도 분석에서는
 `teacher/extract_teacher.py --save-attention-rows`를 사용할 수 있습니다. 큰
 분석 행렬이 학습 shard와 섞이지 않도록 별도 `--output-root`를 지정하는 편이
