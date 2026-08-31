@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from future_dllm import CustomCache, sparse_dllm_current_score
-from visualization.figure_1 import candidate_regions, topk_metrics
+from visualization.figure_1 import (
+    aggregate_future_rows,
+    candidate_regions,
+    topk_metrics,
+)
 
 
 class SparseDLLMScoreTest(unittest.TestCase):
@@ -67,6 +71,22 @@ class FigureMetricsTest(unittest.TestCase):
         regions = candidate_regions(block)
         self.assertEqual([region["count"] for region in regions], [5, 4, 8])
         self.assertEqual(sum(region["count"] for region in regions), 17)
+
+    def test_sentence_aggregation_uses_teacher_aligned_rowmax(self):
+        rows = torch.tensor([
+            [0.1, 0.4],
+            [0.3, 0.2],
+            [0.5, 0.1],
+            [0.2, 0.6],
+        ])
+        groups = [
+            {"start": 0, "end": 2, "label": "S1"},
+            {"start": 2, "end": 4, "label": "S2"},
+        ]
+        actual = aggregate_future_rows(rows, groups)
+        torch.testing.assert_close(
+            actual, torch.tensor([[0.3, 0.4], [0.5, 0.6]])
+        )
 
 
 if __name__ == "__main__":

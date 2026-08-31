@@ -42,6 +42,37 @@ activation용으로 남기고 일부 model layer를 CPU에 배치합니다. 전�
 - `metrics.csv`: block/layer별 Mass@K와 Recall@K
 - `summary.json`: 전체 평균과 선택한 정성 패널의 수치
 
+## MultiNews paper figure
+
+MultiNews에서는 `|||||` 문서 구분자를 자동으로 찾아 prompt token 축에
+`Article 1 | Article 2 | ...` 경계를 표시할 수 있습니다. 본문 Figure에는
+긴 summary를 생성하고 네 기사 경계를 보존하는 `multinews-77`, 고정 layer
+index 24, summary 중간 이후의 block index 8을 사용합니다.
+
+```bash
+python visualization/figure_1.py \
+  --dataset multi_news \
+  --sample-index 77 \
+  --student artifacts/ckpts/<run>/checkpoint-best \
+  --layer 24 \
+  --block-index 8 \
+  --keep-ratio 0.1 \
+  --summary-granularity sentence \
+  --qualitative-scope prompt \
+  --output-dir artifacts/figure_1_multinews_77/prompt_sentence
+```
+
+`sentence`는 각 summary sentence 안에서 token별 future attention을 max로
+집계하므로 teacher의 `label_final_rowmax` 정의와 일치합니다. `prompt` scope는
+정성 heatmap만 기사 영역으로 crop합니다. Top-K 선택과 오른쪽 Mass/Recall은
+여전히 prompt, previous summary, future masked summary가 경쟁하는 전체 cache
+candidate pool에서 계산합니다. 세부 token 패턴은 같은 `analysis.pt`를
+`--summary-granularity token`으로 다시 그리면 됩니다.
+
+저장된 teacher shard가 있으면 selection state를 replay하고 마지막 block만
+denoise합니다. replay한 token별 row의 max가 저장 `label_final_rowmax`와
+일치하는지 모든 block에서 검사하며, 결과는 `summary.json`에도 기록합니다.
+
 모델을 다시 실행하지 않고 K나 정성 layer/block만 바꾸려면 저장된 원자료를
 사용합니다.
 
