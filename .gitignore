@@ -8,6 +8,7 @@ __pycache__/
 artifacts/*
 !artifacts/README.md
 results/*
+!results/result.md
 
 # Run logs from training and evaluation.
 logs/

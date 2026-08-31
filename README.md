@@ -112,6 +112,7 @@ python student/train_student.py --teacher-root artifacts/teacher/samsum
 ```
 sample ckpt : https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip
 
+
 ## 추론
 
 ```bash
@@ -129,4 +130,3 @@ MAX_SEQ_LEN=10240 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/check
 # 길이 일반화 비교가 필요하면 프롬프트만의 상한도 별도로 선택
 MAX_SEQ_LEN=4096 MAX_PROMPT_LEN=2048 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/checkpoint-best
 ```
-*발표자료에서 보여드렸던 훈련셋을 다르게 구성하여 발표자료랑 성능이 동일하지 않습니다.
