@@ -215,6 +215,17 @@ def main():
             recalls.append(recall_grid(pred.detach(), tgt))
         return total / max(1, L), sum(recalls) / max(1, len(recalls))
 
+    def save_ckpt(path, epoch, score, means):
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save({k: v.cpu() for k, v in student.state_dict().items()},
+                   path / "pytorch_model.bin")
+        json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
+                   "mlp_dim": args.mlp_dim, "heads": ["score"]},
+                  open(path / "config.json", "w"))
+        json.dump({"val_recall": score, "val_recall_per_dataset": means,
+                   "epoch": epoch, "datasets": datasets},
+                  open(path / "val.json", "w"))
+
     best = -1.0
     for epoch in range(args.epochs):
         student.train(); random.shuffle(train_shards)
@@ -237,15 +248,14 @@ def main():
         print(f"epoch {epoch}: loss {sum(losses)/len(losses):.4f} | "
               f"val recall macro {score:.4f} [{detail}] | "
               f"{(time.time()-started)/60:.1f}min", flush=True)
+        # Every epoch is kept. Val recall plateaus inside a ~0.001 band while
+        # downstream scores still move several points across that band, so the
+        # argmax is not a trustworthy pick and has to stay revisable afterwards.
+        save_ckpt(out_dir / f"checkpoint-epoch{epoch}", epoch, score, means)
+        print(f"  saved epoch {epoch}", flush=True)
         if score > best:
             best = score
-            ckpt = out_dir / "checkpoint-best"
-            ckpt.mkdir(parents=True, exist_ok=True)
-            torch.save({k: v.cpu() for k, v in student.state_dict().items()},
-                       ckpt / "pytorch_model.bin")
-            json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
-                       "mlp_dim": args.mlp_dim, "heads": ["score"]},
-                      open(ckpt / "config.json", "w"))
+            save_ckpt(out_dir / "checkpoint-best", epoch, score, means)
             json.dump({"blk": student.block_proj_norms()},
                       open(out_dir / "block_proj_norms.json", "w"), indent=2)
             json.dump({"val_recall": score, "val_recall_per_dataset": means,
