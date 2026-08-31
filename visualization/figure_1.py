@@ -495,8 +495,14 @@ def render_figure(
     mass_ours = float(np.mean([row["ours_mass_at_k"] for row in metric_rows]))
     recall_current = float(np.mean([row["current_recall_at_k"] for row in metric_rows]))
     recall_ours = float(np.mean([row["ours_recall_at_k"] for row in metric_rows]))
+    actual_keep_ratio = float(payload["actual_keep_ratio"])
+    evicted_ratio = 1.0 - actual_keep_ratio
     x = np.arange(2)
     width = 0.34
+    metric_axis.axhline(
+        1.0, color="#545B66", linestyle=(0, (4, 3)), linewidth=1.1,
+        label="Full cache (1.0)", zorder=1,
+    )
     current_bars = metric_axis.bar(
         x - width / 2, [mass_current, recall_current], width,
         color="#4C78A8", label="Sparse-dLLM"
@@ -509,6 +515,8 @@ def render_figure(
     metric_axis.set_ylim(0.0, 1.05)
     metric_axis.set_ylabel("Score (higher is better)")
     metric_axis.set_title(
+        f"Keep ratio {payload['requested_keep_ratio']:.1f} "
+        f"({actual_keep_ratio:.1%} retained)\n"
         f"All {payload['layer_count']} layers × {len(payload['blocks'])} blocks",
         fontsize=9.5, pad=10,
     )
@@ -528,14 +536,15 @@ def render_figure(
     figure.text(
         0.50, 0.915,
         f"{payload['dataset']} sample {sample_text}  ·  block {args.block_index + 1}  ·  "
-        f"layer {layer + 1} (index {layer})  ·  K={payload['cache_budget']} / "
-        f"{candidate_count}",
+        f"layer {layer + 1} (index {layer})  ·  keep ratio "
+        f"{payload['requested_keep_ratio']:.1f} → K={payload['cache_budget']} / "
+        f"{candidate_count} ({actual_keep_ratio:.1%} retained, {evicted_ratio:.1%} evicted)",
         ha="center", va="center", fontsize=9.5, color="#4B515B",
     )
     figure.text(
         0.105, 0.035,
         "Heatmaps are normalized only for display (score strips per panel; future usage per answer row). "
-        "Black ticks mark Top-K. Mass@K and Recall@K use raw label_final_rowmax values.",
+        "Black ticks mark Top-K; the dashed line is full cache. Metrics use raw label_final_rowmax values.",
         ha="left", va="center", fontsize=7.6, color="#5B616B",
     )
 
@@ -558,7 +567,14 @@ def render_figure(
         "qualitative_layer_index": layer,
         "candidate_count": candidate_count,
         "cache_budget": int(payload["cache_budget"]),
+        "requested_keep_ratio": float(payload["requested_keep_ratio"]),
+        "actual_keep_ratio": actual_keep_ratio,
+        "evicted_ratio": evicted_ratio,
         "averaging_units": len(metric_rows),
+        "full_cache_reference": {
+            "future_mass": 1.0,
+            "future_recall": 1.0,
+        },
         "average": {
             "current_mass_at_k": mass_current,
             "ours_mass_at_k": mass_ours,
@@ -585,7 +601,14 @@ def write_outputs(payload: dict[str, Any], args: argparse.Namespace) -> dict[str
     }
     if len(candidate_counts) != 1:
         raise SystemExit("all blocks must use the same candidate count")
-    cache_budget = _resolve_budget(args, candidate_counts.pop())
+    candidate_count = candidate_counts.pop()
+    cache_budget = _resolve_budget(args, candidate_count)
+    payload["requested_keep_ratio"] = (
+        float(args.keep_ratio)
+        if args.cache_budget is None
+        else cache_budget / candidate_count
+    )
+    payload["actual_keep_ratio"] = cache_budget / candidate_count
     metric_rows = attach_budget_results(payload, cache_budget)
 
     analysis_path = output_dir / "analysis.pt"
