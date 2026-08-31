@@ -6,6 +6,7 @@ from future_dllm import CustomCache, sparse_dllm_current_score
 from visualization.figure_1 import (
     aggregate_future_rows,
     candidate_regions,
+    mask_future_attention,
     topk_metrics,
 )
 
@@ -87,6 +88,17 @@ class FigureMetricsTest(unittest.TestCase):
         torch.testing.assert_close(
             actual, torch.tensor([[0.3, 0.4], [0.5, 0.6]])
         )
+
+    def test_retained_attention_heatmap_zeros_evicted_columns(self):
+        rows = torch.tensor([
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.6, 0.7, 0.8],
+        ])
+        actual = mask_future_attention(rows, torch.tensor([1, 3]))
+        torch.testing.assert_close(actual, torch.tensor([
+            [0.0, 0.2, 0.0, 0.4],
+            [0.0, 0.6, 0.0, 0.8],
+        ]))
 
 
 if __name__ == "__main__":

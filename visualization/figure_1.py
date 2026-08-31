@@ -688,64 +688,15 @@ def attach_budget_results(payload: dict[str, Any], cache_budget: int) -> list[di
     return metric_rows
 
 
-def _score_display(score: torch.Tensor) -> np.ndarray:
-    values = score.detach().float().cpu().numpy()
-    low, high = np.quantile(values, [0.02, 0.98])
-    if not math.isfinite(float(high)) or high <= low:
-        return np.zeros_like(values, dtype=np.float32)
-    return np.clip((values - low) / (high - low), 0.0, 1.0)
-
-
-def _future_display(rows: torch.Tensor) -> np.ndarray:
-    values = rows.detach().float().cpu().numpy()
-    maxima = np.maximum(values.max(axis=1, keepdims=True), 1e-12)
-    return np.sqrt(np.clip(values / maxima, 0.0, 1.0))
-
-
-def _add_regions(
-    axis: Any,
-    regions: list[dict[str, Any]],
-    labels: bool = False,
-    label_names: set[str] | None = None,
-) -> None:
-    for region in regions:
-        start, end = region["start"], region["end"]
-        axis.axvspan(start - 0.5, end - 0.5, color=region["color"], alpha=0.10,
-                    linewidth=0)
-        if start:
-            axis.axvline(start - 0.5, color="#525866", linewidth=0.75, alpha=0.8)
-        if labels and (label_names is None or region["name"] in label_names):
-            midpoint = (start + end - 1) / 2
-            display_name = {
-                "Previously completed blocks": "Prev.",
-                "Future masked blocks": "Future",
-            }.get(region["name"], region["name"])
-            axis.text(midpoint, 1.16,
-                      f"{display_name}\n(n={region['count']})",
-                      transform=axis.get_xaxis_transform(), ha="center", va="bottom",
-                      fontsize=8.5, color="#30343B", clip_on=False)
-
-
-def _add_article_regions(
-    axis: Any, article_regions: list[dict[str, Any]], labels: bool = False
-) -> None:
-    colors = ("#D9EAF3", "#E2F0D9", "#FCE4D6", "#E4DFEC", "#FFF2CC")
-    for index, region in enumerate(article_regions):
-        start, end = int(region["start"]), int(region["end"])
-        axis.axvspan(start - 0.5, end - 0.5, color=colors[index % len(colors)],
-                    alpha=0.14, linewidth=0)
-        axis.axvline(start - 0.5, color="#3F4650", linewidth=0.65,
-                     linestyle=(0, (2, 2)), alpha=0.85)
-        axis.axvline(end - 0.5, color="#3F4650", linewidth=0.65,
-                     linestyle=(0, (2, 2)), alpha=0.85)
-        if labels:
-            midpoint = (start + end - 1) / 2
-            axis.text(
-                midpoint, 1.16,
-                f"{region['name']}\n(n={region['count']})",
-                transform=axis.get_xaxis_transform(), ha="center", va="bottom",
-                fontsize=8.0, color="#30343B", clip_on=False,
-            )
+def mask_future_attention(
+    future_attention_rows: torch.Tensor,
+    keep_indices: torch.Tensor | np.ndarray,
+) -> torch.Tensor:
+    """Show the future attention that remains accessible after eviction."""
+    keep = torch.as_tensor(keep_indices, dtype=torch.long)
+    masked = torch.zeros_like(future_attention_rows)
+    masked[..., keep] = future_attention_rows[..., keep]
+    return masked
 
 
 def render_figure(
@@ -763,7 +714,8 @@ def render_figure(
         "ps.fonttype": 42,
     })
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.colors import ListedColormap, PowerNorm
+    from matplotlib.ticker import MaxNLocator
 
     if args.block_index >= len(payload["blocks"]):
         raise SystemExit(
@@ -776,6 +728,8 @@ def render_figure(
         )
     block = payload["blocks"][args.block_index]
     candidate_count = int(block["candidate_indices"].numel())
+    actual_keep_ratio = float(payload["actual_keep_ratio"])
+    evicted_ratio = 1.0 - actual_keep_ratio
     regions = candidate_regions(block)
     if args.qualitative_scope == "prompt":
         display_candidate_count = int(block["prompt_length"])
@@ -786,10 +740,7 @@ def render_figure(
     display_slice = slice(0, display_candidate_count)
     layer = args.layer
 
-    current = _score_display(
-        block["current_score"][layer][display_slice]
-    )[None, :]
-    raw_future_rows = block["future_attention_rows"][layer][:, display_slice]
+    raw_future_rows = block["future_attention_rows"][layer]
     sentence_groups = block.get("completed_sentence_groups") or []
     if args.summary_granularity == "sentence":
         if not sentence_groups:
@@ -797,130 +748,154 @@ def render_figure(
                 "analysis has no completed_sentence_groups; regenerate it before "
                 "using --summary-granularity sentence"
             )
-        display_future_rows = aggregate_future_rows(raw_future_rows, sentence_groups)
+        comparison_rows = aggregate_future_rows(raw_future_rows, sentence_groups)
         future_row_labels = [group["label"] for group in sentence_groups]
-        future_ylabel = "Future Answer Usage\n(sentence-wise max)"
+        future_ylabel = "Completed summary sentence"
     else:
-        display_future_rows = raw_future_rows
+        comparison_rows = raw_future_rows
         future_row_labels = [
             f"{index + 1:02d}  {label}"
             for index, label in enumerate(block["completed_token_labels"])
         ]
-        future_ylabel = "Future Answer Usage"
-    future = _future_display(display_future_rows)
-    ours = _score_display(
-        block["predicted_score"][layer][display_slice]
-    )[None, :]
-    current_keep = block["current_keep"][layer].numpy()
-    ours_keep = block["ours_keep"][layer].numpy()
-    current_keep = current_keep[current_keep < display_candidate_count]
-    ours_keep = ours_keep[ours_keep < display_candidate_count]
+        future_ylabel = "Completed answer token"
 
-    blue = LinearSegmentedColormap.from_list("current", ["#F7FAFC", "#2B6CB0"])
-    orange = LinearSegmentedColormap.from_list("future", ["#FFF9F2", "#D95F02"])
-    green = LinearSegmentedColormap.from_list("ours", ["#F5FBF8", "#16866A"])
+    current_keep = block["current_keep"][layer]
+    oracle_keep = block["oracle_keep"][layer]
+    ours_keep = block["ours_keep"][layer]
+    heatmaps = [
+        mask_future_attention(comparison_rows, keep)[..., display_slice]
+        .detach().float().cpu().numpy()
+        for keep in (current_keep, oracle_keep, ours_keep)
+    ]
+    unmasked_future = comparison_rows[..., display_slice].detach().float().cpu().numpy()
+    finite_future = unmasked_future[np.isfinite(unmasked_future)]
+    positive_future = finite_future[finite_future > 0]
+    if positive_future.size:
+        color_max = float(np.quantile(positive_future, 0.995))
+        color_max = max(color_max, float(positive_future.min()))
+    else:
+        color_max = 1.0
+    attention_norm = PowerNorm(gamma=0.40, vmin=0.0, vmax=color_max, clip=True)
 
-    figure = plt.figure(figsize=(15.2, 8.2), constrained_layout=False)
-    left_margin = 0.155 if args.summary_granularity == "sentence" else 0.105
-    grid = figure.add_gridspec(
-        3, 2, width_ratios=(6.5, 1.45), height_ratios=(1.0, 4.7, 1.0),
-        left=left_margin, right=0.975, bottom=0.10, top=0.82,
-        hspace=0.26, wspace=0.18,
+    selected_recall = (
+        float(block["current_recall_at_k"][layer]),
+        1.0,
+        float(block["ours_recall_at_k"][layer]),
     )
-    current_axis = figure.add_subplot(grid[0, 0])
-    future_axis = figure.add_subplot(grid[1, 0], sharex=current_axis)
-    ours_axis = figure.add_subplot(grid[2, 0], sharex=current_axis)
-    metric_axis = figure.add_subplot(grid[:, 1])
+    retention_colors = ["#4C78A8", "#5B4B8A", "#1B9E77"]
 
-    for axis, values, cmap, label in (
-        (current_axis, current, blue, "Current-State Score"),
-        (ours_axis, ours, green, "Ours Prediction"),
-    ):
-        axis.imshow(values, aspect="auto", interpolation="nearest", cmap=cmap,
-                    vmin=0.0, vmax=1.0)
-        axis.set_yticks([])
-        axis.set_ylabel(label, rotation=0, ha="right", va="center",
-                        labelpad=17, fontsize=10, fontweight="bold")
-        axis.tick_params(axis="x", length=0)
-        for spine in axis.spines.values():
-            spine.set_color("#9AA0AA")
-            spine.set_linewidth(0.65)
-    current_axis.scatter(current_keep, np.full_like(current_keep, 0.72, dtype=float),
-                         marker="|", s=45, linewidths=1.1, color="#181A1F",
-                         clip_on=False, label="Sparse-dLLM Top-K")
-    ours_axis.scatter(ours_keep, np.full_like(ours_keep, 0.72, dtype=float),
-                      marker="|", s=45, linewidths=1.1, color="#181A1F",
-                      clip_on=False, label="Ours Top-K")
-    current_axis.set_ylim(0.86, -0.5)
-    ours_axis.set_ylim(0.86, -0.5)
+    figure = plt.figure(figsize=(16.6, 5.35), constrained_layout=False)
+    grid = figure.add_gridspec(
+        1, 4, width_ratios=(1.0, 1.0, 1.0, 0.72),
+        left=0.055, right=0.985, bottom=0.18, top=0.91, wspace=0.25,
+    )
+    heatmap_axes = [figure.add_subplot(grid[0, index]) for index in range(3)]
+    metric_axis = figure.add_subplot(grid[0, 3])
 
-    future_axis.imshow(future, aspect="auto", interpolation="nearest", cmap=orange,
-                       vmin=0.0, vmax=1.0)
-    future_axis.set_ylabel(future_ylabel, rotation=0, ha="right", va="center",
-                           labelpad=17, fontsize=10, fontweight="bold",
-                           multialignment="center")
-    row_count = len(future_row_labels)
-    tick_count = min(8, row_count)
-    ticks = np.unique(np.linspace(0, row_count - 1, tick_count).round().astype(int))
-    labels = []
-    for tick in ticks:
-        labels.append(future_row_labels[int(tick)].replace("$", "\\$"))
-    future_axis.set_yticks(ticks, labels, fontsize=7.2)
-    future_axis.tick_params(axis="y", length=0, pad=4)
-    for spine in future_axis.spines.values():
-        spine.set_color("#9AA0AA")
-        spine.set_linewidth(0.65)
-
+    image_artist = None
     article_regions = payload.get("article_regions") or []
-    if article_regions:
-        tail_names = {"Previously completed blocks", "Future masked blocks"}
-        _add_regions(current_axis, display_regions, labels=True, label_names=tail_names)
-        _add_article_regions(current_axis, article_regions, labels=True)
-    else:
-        _add_regions(current_axis, display_regions, labels=True)
-    _add_regions(future_axis, display_regions)
-    _add_regions(ours_axis, display_regions)
-    if article_regions:
-        _add_article_regions(future_axis, article_regions)
-        _add_article_regions(ours_axis, article_regions)
-    current_axis.tick_params(labelbottom=False)
-    future_axis.tick_params(labelbottom=False, axis="x", length=0)
-    ours_axis.set_xlim(-0.5, display_candidate_count - 0.5)
-    if args.qualitative_scope == "prompt":
-        x_label = "Prompt token position  →   (global Top-K also includes response suffix)"
-    else:
-        x_label = "Cache candidate position  →   (current block excluded)"
-    ours_axis.set_xlabel(x_label, fontsize=9.5, labelpad=7)
-    # Label each region's first candidate and the final candidate.  Showing
-    # both sides of a boundary (e.g. 58 and 59) is redundant and overlaps in
-    # the paper-width rendering.
-    tick_candidates = sorted(set(
-        [0, display_candidate_count - 1]
-        + [region["start"] for region in display_regions]
-    ))
-    tick_positions = []
-    minimum_tick_gap = max(1, int(display_candidate_count * 0.04))
-    for position in tick_candidates:
-        if (not tick_positions or position - tick_positions[-1] >= minimum_tick_gap
-                or position == display_candidate_count - 1):
-            tick_positions.append(position)
-    if (len(tick_positions) >= 2
-            and tick_positions[-1] - tick_positions[-2] < minimum_tick_gap):
-        tick_positions.pop(-2)
-    ours_axis.set_xticks(tick_positions, [str(position) for position in tick_positions],
-                         fontsize=7.5)
+    for panel_index, (axis, values, keep, recall, retain_color) in enumerate(zip(
+        heatmap_axes, heatmaps, (current_keep, oracle_keep, ours_keep),
+        selected_recall, retention_colors,
+    )):
+        image_artist = axis.imshow(
+            values, aspect="auto", interpolation="nearest", cmap="viridis",
+            norm=attention_norm, origin="upper",
+        )
+        axis.set_xlabel("Prompt key position", fontsize=8.5, labelpad=6)
+        if panel_index == 0:
+            axis.set_ylabel(future_ylabel, fontsize=9.0, labelpad=7)
+        else:
+            axis.tick_params(labelleft=False)
+
+        row_count = len(future_row_labels)
+        tick_count = min(5, row_count)
+        y_ticks = np.unique(
+            np.linspace(0, row_count - 1, tick_count).round().astype(int)
+        )
+        if args.summary_granularity == "token":
+            y_labels = [str(int(tick) + 1) for tick in y_ticks]
+        else:
+            y_labels = [f"S{int(tick) + 1}" for tick in y_ticks]
+        axis.set_yticks(y_ticks, y_labels, fontsize=7.5)
+        axis.tick_params(length=2.5, width=0.6)
+        axis.set_xlim(-0.5, display_candidate_count - 0.5)
+        axis.set_xticks(
+            [0, display_candidate_count - 1],
+            ["0", str(display_candidate_count - 1)], fontsize=7.5,
+        )
+        axis.text(
+            0.975, 0.965, f"GT overlap@K: {recall:.1%}",
+            transform=axis.transAxes, ha="right", va="top", fontsize=7.5,
+            color="white",
+            bbox={"boxstyle": "round,pad=0.22", "facecolor": "#171923",
+                  "edgecolor": "none", "alpha": 0.72},
+        )
+        for spine in axis.spines.values():
+            spine.set_color("#7E8490")
+            spine.set_linewidth(0.65)
+
+        keep_mask = np.zeros(candidate_count, dtype=np.uint8)
+        keep_mask[np.asarray(keep, dtype=np.int64)] = 1
+        mask_axis = axis.inset_axes([0.0, 1.018, 1.0, 0.035])
+        mask_axis.imshow(
+            keep_mask[display_slice][None, :], aspect="auto",
+            interpolation="nearest",
+            cmap=ListedColormap(["#E5E7EB", retain_color]), vmin=0, vmax=1,
+        )
+        mask_axis.set_axis_off()
+
+        if article_regions:
+            for article_index, region in enumerate(article_regions):
+                start = max(0, int(region["start"]))
+                end = min(display_candidate_count, int(region["end"]))
+                if end <= start:
+                    continue
+                for boundary in (start, end):
+                    axis.axvline(
+                        boundary - 0.5, color="white", linewidth=0.55,
+                        linestyle=(0, (2, 2)), alpha=0.80,
+                    )
+                midpoint = (start + end - 1) / 2
+                axis.text(
+                    midpoint, 1.085, f"A{article_index + 1}",
+                    transform=axis.get_xaxis_transform(), ha="center", va="bottom",
+                    fontsize=7.0, color="#3F4650", clip_on=False,
+                )
+        else:
+            for region in display_regions:
+                start, end = int(region["start"]), int(region["end"])
+                axis.axvline(start - 0.5, color="white", linewidth=0.55,
+                            linestyle=(0, (2, 2)), alpha=0.80)
+                axis.text(
+                    (start + end - 1) / 2, 1.085, region["name"],
+                    transform=axis.get_xaxis_transform(), ha="center", va="bottom",
+                    fontsize=6.8, color="#3F4650", clip_on=False,
+                )
+
+    if image_artist is not None:
+        colorbar = figure.colorbar(
+            image_artist, ax=heatmap_axes, orientation="horizontal",
+            fraction=0.045, pad=0.115, aspect=45,
+        )
+        colorbar.set_label(
+            "Actual completed-answer attention retained after eviction "
+            "(shared scale)",
+            fontsize=8.2,
+        )
+        colorbar.locator = MaxNLocator(nbins=4)
+        colorbar.update_ticks()
+        colorbar.ax.tick_params(labelsize=7, length=2)
 
     mass_current = float(np.mean([row["current_mass_at_k"] for row in metric_rows]))
     mass_ours = float(np.mean([row["ours_mass_at_k"] for row in metric_rows]))
     recall_current = float(np.mean([row["current_recall_at_k"] for row in metric_rows]))
     recall_ours = float(np.mean([row["ours_recall_at_k"] for row in metric_rows]))
-    actual_keep_ratio = float(payload["actual_keep_ratio"])
-    evicted_ratio = 1.0 - actual_keep_ratio
     x = np.arange(2)
     width = 0.34
     metric_axis.axhline(
         1.0, color="#545B66", linestyle=(0, (4, 3)), linewidth=1.1,
-        label="Full cache (1.0)", zorder=1,
+        label="_nolegend_", zorder=1,
     )
     current_bars = metric_axis.bar(
         x - width / 2, [mass_current, recall_current], width,
@@ -933,47 +908,49 @@ def render_figure(
     metric_axis.set_xticks(x, ["Future-\nMass@K", "Future-\nRecall@K"])
     metric_axis.set_ylim(0.0, 1.05)
     metric_axis.set_ylabel("Score (higher is better)")
-    metric_axis.set_title(
-        f"Keep ratio {payload['requested_keep_ratio']:.1f} "
-        f"({actual_keep_ratio:.1%} retained)\n"
-        f"All {payload['layer_count']} layers × {len(payload['blocks'])} blocks",
-        fontsize=9.5, pad=10,
-    )
     metric_axis.grid(axis="y", color="#D8DCE3", linewidth=0.65, alpha=0.8)
     metric_axis.set_axisbelow(True)
     metric_axis.spines[["top", "right"]].set_visible(False)
-    metric_axis.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.10),
-                       fontsize=8.5)
+    metric_axis.legend(
+        frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.015),
+        ncol=2, fontsize=8.0, borderaxespad=0.0,
+    )
     for bars in (current_bars, ours_bars):
         metric_axis.bar_label(bars, fmt="%.3f", padding=3, fontsize=8)
 
     sample_text = str(payload.get("sample_id", payload.get("sample_index", "?")))
-    figure.suptitle(
-        "Predicting Which Cache Entries the Completed Answer Will Use",
-        x=0.50, y=0.965, fontsize=15, fontweight="bold",
-    )
-    figure.text(
-        0.50, 0.915,
-        f"{payload['dataset']} sample {sample_text}  ·  block {args.block_index + 1}  ·  "
-        f"layer {layer + 1} (index {layer})  ·  keep ratio "
-        f"{payload['requested_keep_ratio']:.1f} → K={payload['cache_budget']} / "
-        f"{candidate_count} ({actual_keep_ratio:.1%} retained, {evicted_ratio:.1%} evicted)  ·  "
-        f"{args.summary_granularity} rows  ·  {args.qualitative_scope} scope",
-        ha="center", va="center", fontsize=9.5, color="#4B515B",
-    )
-    figure.text(
-        left_margin, 0.035,
-        "Heatmaps are normalized only for display. Black ticks mark the global Top-K; the dashed line is full cache. "
-        + ("Qualitative columns crop to prompt articles; metrics use all cache candidates."
-           if args.qualitative_scope == "prompt"
-           else "Metrics use raw label_final_rowmax values over all cache candidates."),
-        ha="left", va="center", fontsize=7.6, color="#5B616B",
-    )
 
     png_path = output_dir / "figure_1.png"
     pdf_path = output_dir / "figure_1.pdf"
     figure.savefig(png_path, dpi=300, bbox_inches="tight", facecolor="white")
     figure.savefig(pdf_path, bbox_inches="tight", facecolor="white")
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    panel_paths = {}
+    for name, axis in zip(
+        ("sparse", "oracle", "ours", "metrics"),
+        (*heatmap_axes, metric_axis),
+    ):
+        visible_axes = {item: item.get_visible() for item in figure.axes}
+        keep_visible = {axis, *axis.child_axes}
+        for item in figure.axes:
+            if item not in keep_visible:
+                item.set_visible(False)
+        extent = axis.get_tightbbox(renderer).transformed(
+            figure.dpi_scale_trans.inverted()
+        ).expanded(1.03, 1.05)
+        if axis in heatmap_axes:
+            extent.y1 += 0.20
+        panel_png = output_dir / f"panel_{name}.png"
+        panel_pdf = output_dir / f"panel_{name}.pdf"
+        figure.savefig(panel_png, dpi=300, bbox_inches=extent, facecolor="white")
+        figure.savefig(panel_pdf, bbox_inches=extent, facecolor="white")
+        for item, visible in visible_axes.items():
+            item.set_visible(visible)
+        panel_paths[name] = {
+            "png": str(panel_png.resolve()),
+            "pdf": str(panel_pdf.resolve()),
+        }
     plt.close(figure)
 
     selected_row = next(
@@ -1001,9 +978,19 @@ def render_figure(
         "qualitative_layer_index": layer,
         "summary_granularity": args.summary_granularity,
         "qualitative_scope": args.qualitative_scope,
-        "future_display_rows": row_count,
+        "future_display_rows": len(future_row_labels),
         "candidate_count": candidate_count,
         "display_candidate_count": display_candidate_count,
+        "heatmap_definition": (
+            "full-cache future_attention_rows multiplied by each method's global "
+            "Top-K retention mask"
+        ),
+        "attention_color_scale": {
+            "shared_across_panels": True,
+            "power_gamma": 0.40,
+            "vmax_quantile": 0.995,
+            "vmax": color_max,
+        },
         "cache_budget": int(payload["cache_budget"]),
         "requested_keep_ratio": float(payload["requested_keep_ratio"]),
         "actual_keep_ratio": actual_keep_ratio,
@@ -1028,6 +1015,7 @@ def render_figure(
         "teacher_replay_rowmax": replay_summary,
         "figure_png": str(png_path.resolve()),
         "figure_pdf": str(pdf_path.resolve()),
+        "panel_files": panel_paths,
     }
 
 

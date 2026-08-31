@@ -47,7 +47,7 @@ activation용으로 남기고 일부 model layer를 CPU에 배치합니다. 전�
 MultiNews에서는 `|||||` 문서 구분자를 자동으로 찾아 prompt token 축에
 `Article 1 | Article 2 | ...` 경계를 표시할 수 있습니다. 본문 Figure에는
 긴 summary를 생성하고 네 기사 경계를 보존하는 `multinews-77`, 고정 layer
-index 24, summary 중간 이후의 block index 8을 사용합니다.
+index 24, summary 중간의 block index 7을 사용합니다.
 
 ```bash
 python visualization/figure_1.py \
@@ -55,19 +55,24 @@ python visualization/figure_1.py \
   --sample-index 77 \
   --student artifacts/ckpts/<run>/checkpoint-best \
   --layer 24 \
-  --block-index 8 \
+  --block-index 7 \
   --keep-ratio 0.1 \
-  --summary-granularity sentence \
+  --summary-granularity token \
   --qualitative-scope prompt \
-  --output-dir artifacts/figure_1_multinews_77/prompt_sentence
+  --output-dir artifacts/figure_1_multinews_77/retained_attention_token
 ```
 
-`sentence`는 각 summary sentence 안에서 token별 future attention을 max로
-집계하므로 teacher의 `label_final_rowmax` 정의와 일치합니다. `prompt` scope는
-정성 heatmap만 기사 영역으로 crop합니다. Top-K 선택과 오른쪽 Mass/Recall은
-여전히 prompt, previous summary, future masked summary가 경쟁하는 전체 cache
-candidate pool에서 계산합니다. 세부 token 패턴은 같은 `analysis.pt`를
-`--summary-granularity token`으로 다시 그리면 됩니다.
+세 heatmap은 모두 같은 full-cache `future_attention_rows`에서 시작합니다.
+각각 Sparse-dLLM, `label_final_rowmax` oracle, ours가 선택한 global Top-10%
+열만 남기고 나머지 열을 0으로 만들어, 실제 future attention 중 각 eviction
+방법이 보존한 부분을 같은 color scale로 비교합니다. 위의 가는 띠는 각 방법이
+남긴 cache 위치입니다. `prompt` scope는 정성 heatmap만 기사 영역으로
+crop합니다. Top-K 선택과 오른쪽 Mass/Recall은 여전히 prompt, previous summary,
+future masked summary가 경쟁하는 전체 cache candidate pool에서 계산합니다.
+
+`sentence`를 사용하면 completed answer token 행을 sentence-wise max로 줄일 수
+있지만, Sparse-dLLM 논문의 query-token × key-token attention map과 같은 형태의
+본문 Figure에는 `token`을 사용합니다.
 
 저장된 teacher shard가 있으면 selection state를 replay하고 마지막 block만
 denoise합니다. replay한 token별 row의 max가 저장 `label_final_rowmax`와
