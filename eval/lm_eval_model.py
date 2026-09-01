@@ -140,6 +140,7 @@ class LLaDAFuture(HFLM):
                 "eviction needs a trained scorer: pass student_path=<checkpoint>, "
                 "or keep_ratio=1.0 to run without eviction")
         print(f"[LLaDA_future] keep_ratio={keep_ratio} block_len={block_len} "
+              "cache_selection_step=0 "
               f"max_seq_len={self._max_seq_len} "
               f"max_prompt_len={self._max_prompt_len} "
               f"scorer={student_path or 'none (no eviction)'}", flush=True)

@@ -133,6 +133,13 @@ def load_prompt_utility_student(
         )
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     raw_config["heads"] = tuple(raw_config.get("heads", ("score",)))
+    selection_step = raw_config.pop(
+        "cache_selection_step", raw_config.pop("cache_delay_steps", None)
+    )
+    if selection_step != 0:
+        raise RuntimeError(
+            "checkpoint was not trained for first-step cache selection"
+        )
     legacy_cond = raw_config.pop("cond", None)
     if legacy_cond not in (None, "blk"):
         raise RuntimeError(

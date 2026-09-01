@@ -104,7 +104,7 @@ if [ "$UNSAFE_TASK" -eq 1 ]; then
   EXTRA_ARGS+=(--confirm_run_unsafe_code)
 fi
 
-echo "$DATASET keep=$KEEP max_seq_len=$MAX_SEQ_LEN samples=${LIMIT:-all} -> $RESULT"
+echo "$DATASET keep=$KEEP max_seq_len=$MAX_SEQ_LEN cache_selection_step=0 samples=${LIMIT:-all} -> $RESULT"
 cd "$REPO"
 "$PY" eval/run.py \
   --model "$MODEL_NAME" \

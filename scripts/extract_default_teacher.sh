@@ -23,7 +23,7 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$(dirname "$LOG_FILE")" "$PROMPT_ROOT" "$TEACHER_ROOT"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-printf 'default teacher extraction\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nmax_seq_len=%s\nlog=%s\n' \
+printf 'default teacher extraction\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nmax_seq_len=%s\ncache_selection_step=0\nlog=%s\n' \
   "$MODEL" "$DATA_ROOT" "$PROMPT_ROOT" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "$LOG_FILE"
 
 for index in "${!DATASETS[@]}"; do

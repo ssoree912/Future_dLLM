@@ -582,9 +582,9 @@ def sparse_dllm_current_score(
 class CustomCache:
     """Block-wise KV cache with future-attention eviction.
 
-    One instance per block. Step 0-1 run the full sequence and build the cache;
-    ``filter_cache`` then prunes it to ``keep_ratio`` using the student scorer,
-    and steps 2.. run against the pruned cache plus the block itself.
+    One instance per block. The first block step uses ``cache_state=1`` to build
+    and filter the cache from a full-sequence forward. Subsequent
+    ``cache_state=2`` calls run against the pruned cache plus the block itself.
 
     Two modes:
       * deployment - ``cache_scorer`` is a trained student, one selection per
@@ -619,7 +619,7 @@ class CustomCache:
         self.current_scores = {}
 
         # Hidden states the student scores from; the block writes them per layer
-        # on the step-1 forward and filter_cache consumes them.
+        # on the first block step and filter_cache consumes them.
         self.layer_hidden_states = {}
 
         # Teacher collection.

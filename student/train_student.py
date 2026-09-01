@@ -161,6 +161,7 @@ def main():
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
                "val_ratio": args.val_ratio, "pairs": args.pairs,
                "max_seq_len": args.max_seq_len,
+               "cache_selection_step": 0,
                "lambda_list": args.lambda_list,
                "teacher_roots": roots,
                "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
@@ -168,6 +169,13 @@ def main():
 
     @torch.no_grad()
     def features(record):
+        selection_step = record.get(
+            "cache_selection_step", record.get("cache_delay_steps")
+        )
+        if selection_step != 0:
+            raise RuntimeError(
+                "teacher record was not collected at the first block step"
+            )
         sequence_length = int(record["x_at_block_start"].numel())
         if sequence_length > args.max_seq_len:
             raise RuntimeError(
@@ -244,7 +252,8 @@ def main():
             torch.save({k: v.cpu() for k, v in student.state_dict().items()},
                        ckpt / "pytorch_model.bin")
             json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
-                       "mlp_dim": args.mlp_dim, "heads": ["score"]},
+                       "mlp_dim": args.mlp_dim, "heads": ["score"],
+                       "cache_selection_step": 0},
                       open(ckpt / "config.json", "w"))
             json.dump({"blk": student.block_proj_norms()},
                       open(out_dir / "block_proj_norms.json", "w"), indent=2)

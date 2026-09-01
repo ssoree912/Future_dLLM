@@ -50,6 +50,13 @@ def main():
     student = load_prompt_utility_student(args.student, device).float().eval()
 
     def features(record):
+        selection_step = record.get(
+            "cache_selection_step", record.get("cache_delay_steps")
+        )
+        if selection_step != 0:
+            raise RuntimeError(
+                "teacher record was not collected at the first block step"
+            )
         x = record["x_at_block_start"].unsqueeze(0).to(device)
         cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
         cache.layer_hidden_states = {}

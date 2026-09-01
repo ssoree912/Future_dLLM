@@ -1,8 +1,7 @@
 """Block-wise diffusion decoding for LLaDA, with future-attention cache eviction.
 
-The per-block cache is built on step 0 and 1 by running the full sequence;
-``filter_cache`` prunes it to ``keep_ratio`` with the trained scorer, and the
-remaining steps run against the pruned cache plus the block itself.
+The first step of every block builds and filters its cache from the full
+sequence. Remaining steps reuse that cache and recompute only the current block.
 """
 
 import numpy as np
@@ -69,7 +68,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
             x[:, block_start:block_end] == mask_id, steps_per_block)
 
         for i in range(steps_per_block):
-            cache_state = 2 if i > 1 else i
+            cache_state = 1 if i == 0 else 2
             model_input = x if cache_state != 2 else x[:, block_start:block_end]
             mask_index = (model_input == mask_id)
 
