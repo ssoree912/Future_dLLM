@@ -24,7 +24,7 @@ from visualization.figure_1 import (
 METHODS = (
     ("Sparse-dLLM", "current_keep", "current_recall_at_k", "#4C78A8"),
     ("Oracle", "oracle_keep", None, "#6B5CA5"),
-    ("Ours", "ours_keep", "ours_recall_at_k", "#1B9E77"),
+    ("Preview-dLLM", "ours_keep", "ours_recall_at_k", "#1B9E77"),
 )
 
 
@@ -94,8 +94,8 @@ def _color_max(values: np.ndarray) -> float:
 
 def _region_label(name: str) -> str:
     return {
-        "Previously completed blocks": "Prev.",
-        "Future masked blocks": "Future",
+        "Previously completed blocks": "Decoded",
+        "Future masked blocks": "Masked",
     }.get(name, name)
 
 
@@ -109,7 +109,7 @@ def _decorate_heatmap(
     overlap: float,
     show_x: bool,
     show_y: bool,
-    overlap_prefix: str = "GT Top-K overlap",
+    overlap_prefix: str = "Oracle overlap",
 ) -> Any:
     image = axis.imshow(
         values, aspect="auto", interpolation="nearest", cmap="viridis",
@@ -122,7 +122,7 @@ def _decorate_heatmap(
     if not show_y:
         axis.tick_params(labelleft=False)
     if show_x:
-        axis.set_xlabel("Cache candidate position", fontsize=8, labelpad=5)
+        axis.set_xlabel("Cache candidate token", fontsize=8, labelpad=5)
         axis.set_xticks([0, candidate_count - 1], ["0", str(candidate_count - 1)],
                         fontsize=7)
     else:
@@ -150,7 +150,7 @@ def _decorate_heatmap(
         axis.text(
             (start + end - 1) / 2, 1.085, _region_label(region["name"]),
             transform=axis.get_xaxis_transform(), ha="center", va="bottom",
-            fontsize=6.2, color="#3F4650", clip_on=False,
+            fontsize=7.0, color="#3F4650", clip_on=False,
         )
     return image
 
@@ -177,10 +177,10 @@ def render_layer_grid(
     color_max = _color_max(raw_rows[layers].cpu().numpy())
     norm = PowerNorm(gamma=0.40, vmin=0.0, vmax=color_max, clip=True)
     figure, axes = plt.subplots(
-        len(layers), len(METHODS), figsize=(11.1, 3.25 * len(layers)),
+        len(layers), len(METHODS), figsize=(7.15, 2.45 * len(layers)),
         squeeze=False, gridspec_kw={"hspace": 0.34, "wspace": 0.18},
     )
-    figure.subplots_adjust(left=0.075, right=0.985, bottom=0.10, top=0.91)
+    figure.subplots_adjust(left=0.105, right=0.985, bottom=0.10, top=0.91)
     image = None
     for row, layer in enumerate(layers):
         for column, (method, keep_key, recall_key, color) in enumerate(METHODS):
@@ -216,8 +216,7 @@ def render_layer_grid(
         )
         colorbar.set_ticks(np.linspace(0.0, color_max, 4))
         colorbar.ax.tick_params(labelsize=7, length=2)
-        colorbar.set_label("Actual completed-answer attention retained after eviction",
-                           fontsize=8)
+        colorbar.set_label("Retained post-completion attention", fontsize=8)
     layer_suffix = "_".join(f"{layer:02d}" for layer in layers)
     return _save(figure, output_dir, f"figure_1_layers_{layer_suffix}")
 
@@ -243,7 +242,7 @@ def render_layer_average(
     unmasked_mean = raw_rows.mean(dim=0).cpu().numpy()
     color_max = _color_max(unmasked_mean)
     norm = PowerNorm(gamma=0.40, vmin=0.0, vmax=color_max, clip=True)
-    figure, axes = plt.subplots(1, 3, figsize=(11.1, 4.05), squeeze=False)
+    figure, axes = plt.subplots(1, 3, figsize=(7.15, 3.25), squeeze=False)
     axes = axes[0]
     figure.subplots_adjust(left=0.07, right=0.985, bottom=0.18, top=0.83,
                            wspace=0.18)
@@ -257,7 +256,7 @@ def render_layer_average(
         image = _decorate_heatmap(
             axes[column], values, norm, frequency, strip_cmap, regions,
             overlap=overlap, show_x=True, show_y=column == 0,
-            overlap_prefix="Mean GT Top-K overlap",
+            overlap_prefix="Mean oracle overlap",
         )
         axes[column].text(
             0.5, 1.255, method, transform=axes[column].transAxes,
@@ -273,7 +272,7 @@ def render_layer_average(
         colorbar.set_ticks(np.linspace(0.0, color_max, 4))
         colorbar.ax.tick_params(labelsize=7, length=2)
         colorbar.set_label(
-            "Actual retained attention averaged after layer-wise Top-K eviction",
+            "Layer-averaged retained post-completion attention",
             fontsize=8,
         )
     return _save(figure, output_dir, "figure_1_layer_average")

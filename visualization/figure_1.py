@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         help="candidate columns shown; metrics always use the full candidate pool",
     )
     parser.add_argument(
-        "--reference-label", choices=("gt", "future"), default="gt",
+        "--reference-label", choices=("oracle", "future"), default="oracle",
         help="terminology used for the completed-LLaDA-attention reference",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -106,7 +106,7 @@ def topk_metrics(
     future_score: torch.Tensor,
     cache_budget: int,
 ) -> tuple[torch.Tensor, float, float]:
-    """Return kept indices, Future-Mass@K, and GT-Recall@K."""
+    """Return kept indices, Future-Mass@K, and Oracle-Recall@K."""
     predicted_score = predicted_score.flatten().float()
     future_score = future_score.flatten().float()
     if predicted_score.shape != future_score.shape:
@@ -713,7 +713,7 @@ def render_figure(
     matplotlib.use("Agg")
     matplotlib.rcParams.update({
         "font.family": "DejaVu Sans",
-        "font.size": 9,
+        "font.size": 8,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
     })
@@ -760,7 +760,7 @@ def render_figure(
             f"{index + 1:02d}  {label}"
             for index, label in enumerate(block["completed_token_labels"])
         ]
-        future_ylabel = "Completed answer token"
+        future_ylabel = "Completed block token"
 
     current_keep = block["current_keep"][layer]
     oracle_keep = block["oracle_keep"][layer]
@@ -788,13 +788,18 @@ def render_figure(
         1.0,
         float(block["ours_recall_at_k"][layer]),
     )
-    reference_label = "GT" if args.reference_label == "gt" else "Future"
+    reference_label = {
+        "oracle": "Oracle",
+        "future": "Future",
+    }[args.reference_label]
     retention_colors = ["#4C78A8", "#5B4B8A", "#1B9E77"]
 
-    figure = plt.figure(figsize=(16.6, 5.35), constrained_layout=False)
+    # Native two-column paper width: avoids shrinking 8--9 pt labels from a
+    # presentation-sized canvas when the PDF is included at \textwidth.
+    figure = plt.figure(figsize=(7.15, 2.85), constrained_layout=False)
     grid = figure.add_gridspec(
-        1, 4, width_ratios=(1.0, 1.0, 1.0, 0.72),
-        left=0.055, right=0.985, bottom=0.18, top=0.91, wspace=0.25,
+        1, 4, width_ratios=(1.0, 1.0, 1.0, 0.78),
+        left=0.065, right=0.985, bottom=0.28, top=0.84, wspace=0.28,
     )
     heatmap_axes = [figure.add_subplot(grid[0, index]) for index in range(3)]
     metric_axis = figure.add_subplot(grid[0, 3])
@@ -809,14 +814,8 @@ def render_figure(
             values, aspect="auto", interpolation="nearest", cmap="viridis",
             norm=attention_norm, origin="upper",
         )
-        x_axis_label = (
-            "Prompt key position"
-            if args.qualitative_scope == "prompt"
-            else "Cache candidate position"
-        )
-        axis.set_xlabel(x_axis_label, fontsize=8.5, labelpad=6)
         if panel_index == 0:
-            axis.set_ylabel(future_ylabel, fontsize=9.0, labelpad=7)
+            axis.set_ylabel(future_ylabel, fontsize=8.5, labelpad=5)
         else:
             axis.tick_params(labelleft=False)
 
@@ -837,8 +836,8 @@ def render_figure(
             ["0", str(display_candidate_count - 1)], fontsize=7.5,
         )
         axis.text(
-            0.5, 1.145, f"{reference_label} Top-K overlap: {recall:.1%}",
-            transform=axis.transAxes, ha="center", va="bottom", fontsize=8.0,
+            0.5, 1.145, f"{reference_label} overlap: {recall:.1%}",
+            transform=axis.transAxes, ha="center", va="bottom", fontsize=7.3,
             color="#30343B", fontweight="semibold", clip_on=False,
         )
         for spine in axis.spines.values():
@@ -874,8 +873,8 @@ def render_figure(
                 )
             if args.qualitative_scope == "all":
                 tail_labels = {
-                    "Previously completed blocks": "Prev.",
-                    "Future masked blocks": "Fut.",
+                    "Previously completed blocks": "Decoded",
+                    "Future masked blocks": "Masked",
                 }
                 for region in display_regions:
                     if region["name"] not in tail_labels:
@@ -889,13 +888,13 @@ def render_figure(
                         (start + end - 1) / 2, 1.085,
                         tail_labels[region["name"]],
                         transform=axis.get_xaxis_transform(), ha="center",
-                        va="bottom", fontsize=5.8, color="#3F4650",
+                        va="bottom", fontsize=6.7, color="#3F4650",
                         clip_on=False,
                     )
         else:
             short_region_names = {
-                "Previously completed blocks": "Prev.",
-                "Future masked blocks": "Future",
+                "Previously completed blocks": "Decoded",
+                "Future masked blocks": "Masked",
             }
             for region in display_regions:
                 start, end = int(region["start"]), int(region["end"])
@@ -905,21 +904,27 @@ def render_figure(
                     (start + end - 1) / 2, 1.085,
                     short_region_names.get(region["name"], region["name"]),
                     transform=axis.get_xaxis_transform(), ha="center", va="bottom",
-                    fontsize=6.8, color="#3F4650", clip_on=False,
+                    fontsize=6.9, color="#3F4650", clip_on=False,
                 )
 
     if image_artist is not None:
+        heatmap_left = heatmap_axes[0].get_position().x0
+        heatmap_right = heatmap_axes[-1].get_position().x1
+        figure.text(
+            (heatmap_left + heatmap_right) / 2, 0.175,
+            "Cache candidate token", ha="center", va="center", fontsize=8.2,
+        )
+        colorbar_axis = figure.add_axes([
+            heatmap_left, 0.065, heatmap_right - heatmap_left, 0.035,
+        ])
         colorbar = figure.colorbar(
-            image_artist, ax=heatmap_axes, orientation="horizontal",
-            fraction=0.045, pad=0.115, aspect=45,
+            image_artist, cax=colorbar_axis, orientation="horizontal",
         )
         colorbar.set_label(
-            "Actual completed-answer attention retained after eviction "
-            "(shared scale)",
-            fontsize=8.2,
+            "Retained post-completion attention", fontsize=7.5, labelpad=2,
         )
         colorbar.set_ticks(np.linspace(0.0, color_max, 4))
-        colorbar.ax.tick_params(labelsize=7, length=2)
+        colorbar.ax.tick_params(labelsize=6.5, length=2, pad=1)
 
     mass_current = float(np.mean([row["current_mass_at_k"] for row in metric_rows]))
     mass_ours = float(np.mean([row["ours_mass_at_k"] for row in metric_rows]))
@@ -937,22 +942,23 @@ def render_figure(
     )
     ours_bars = metric_axis.bar(
         x + width / 2, [mass_ours, recall_ours], width,
-        color="#1B9E77", label="Ours"
+        color="#1B9E77", label="Preview-dLLM"
     )
     metric_axis.set_xticks(
-        x, ["Future-\nMass@K", f"{reference_label}-\nRecall@K"]
+        x, ["Future\nMass@K", f"{reference_label}\nRecall@K"]
     )
     metric_axis.set_ylim(0.0, 1.05)
-    metric_axis.set_ylabel("Score (higher is better)")
+    metric_axis.set_ylabel("Score ↑", fontsize=8.0, labelpad=4)
     metric_axis.grid(axis="y", color="#D8DCE3", linewidth=0.65, alpha=0.8)
     metric_axis.set_axisbelow(True)
     metric_axis.spines[["top", "right"]].set_visible(False)
     metric_axis.legend(
         frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.015),
-        ncol=2, fontsize=8.0, borderaxespad=0.0,
+        ncol=1, fontsize=6.8, borderaxespad=0.0, labelspacing=0.15,
+        handlelength=1.2,
     )
     for bars in (current_bars, ours_bars):
-        metric_axis.bar_label(bars, fmt="%.3f", padding=3, fontsize=8)
+        metric_axis.bar_label(bars, fmt="%.3f", padding=2, fontsize=7.2)
 
     sample_text = str(payload.get("sample_id", payload.get("sample_index", "?")))
 
@@ -960,8 +966,6 @@ def render_figure(
     pdf_path = output_dir / "figure_1.pdf"
     figure.savefig(png_path, dpi=300, bbox_inches="tight", facecolor="white")
     figure.savefig(pdf_path, bbox_inches="tight", facecolor="white")
-    figure.canvas.draw()
-    renderer = figure.canvas.get_renderer()
     panel_paths = {}
     for name, axis in zip(
         ("sparse", "oracle", "ours", "metrics"),
@@ -972,6 +976,11 @@ def render_figure(
         for item in figure.axes:
             if item not in keep_visible:
                 item.set_visible(False)
+        original_xlabel = axis.get_xlabel()
+        if axis in heatmap_axes:
+            axis.set_xlabel("Cache candidate token", fontsize=8.2, labelpad=4)
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
         extent = axis.get_tightbbox(renderer).transformed(
             figure.dpi_scale_trans.inverted()
         ).expanded(1.03, 1.05)
@@ -981,6 +990,7 @@ def render_figure(
         panel_pdf = output_dir / f"panel_{name}.pdf"
         figure.savefig(panel_png, dpi=300, bbox_inches=extent, facecolor="white")
         figure.savefig(panel_pdf, bbox_inches=extent, facecolor="white")
+        axis.set_xlabel(original_xlabel)
         for item, visible in visible_axes.items():
             item.set_visible(visible)
         panel_paths[name] = {
