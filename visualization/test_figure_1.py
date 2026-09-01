@@ -5,6 +5,7 @@ import torch
 from future_dllm import CustomCache, sparse_dllm_current_score
 from visualization.figure_1 import (
     aggregate_future_rows,
+    attention_mass_at_k,
     candidate_regions,
     mask_future_attention,
     topk_metrics,
@@ -54,13 +55,24 @@ class SparseDLLMScoreTest(unittest.TestCase):
 
 
 class FigureMetricsTest(unittest.TestCase):
-    def test_mass_and_recall_use_rowmax_oracle(self):
+    def test_utility_mass_and_recall_use_rowmax_oracle(self):
         prediction = torch.tensor([0.1, 0.8, 0.7, 0.2])
         future = torch.tensor([0.9, 0.8, 0.1, 0.2])
         keep, mass, recall = topk_metrics(prediction, future, cache_budget=2)
         torch.testing.assert_close(keep, torch.tensor([1, 2]))
         self.assertAlmostEqual(mass, 0.9 / 2.0)
         self.assertAlmostEqual(recall, 0.5)
+
+    def test_attention_mass_normalizes_each_query_row_before_mean(self):
+        rows = torch.tensor([
+            [9.0, 1.0, 0.0],
+            [1.0, 1.0, 98.0],
+        ])
+        actual = attention_mass_at_k(rows, torch.tensor([0]))
+        self.assertAlmostEqual(actual, (0.9 + 0.01) / 2)
+        self.assertAlmostEqual(
+            attention_mass_at_k(rows, torch.tensor([0, 1, 2])), 1.0
+        )
 
     def test_candidate_regions_exclude_current_block(self):
         block = {

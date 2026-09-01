@@ -126,6 +126,28 @@ def topk_metrics(
     return keep.sort().values.cpu(), mass, recall
 
 
+def attention_mass_at_k(
+    attention_rows: torch.Tensor,
+    keep_indices: torch.Tensor | np.ndarray,
+) -> float:
+    """Mean per-query fraction of candidate attention retained by Top-K."""
+    rows = attention_rows.float()
+    if rows.ndim != 2:
+        raise ValueError("attention_rows must be [query tokens, candidates]")
+    if not torch.isfinite(rows).all() or bool((rows < 0).any()):
+        raise ValueError("attention rows must be finite and non-negative")
+    keep = torch.as_tensor(keep_indices, dtype=torch.long, device=rows.device)
+    if keep.ndim != 1 or keep.numel() < 1:
+        raise ValueError("keep_indices must be a non-empty vector")
+    if int(keep.min()) < 0 or int(keep.max()) >= rows.shape[1]:
+        raise ValueError("keep index is outside the candidate dimension")
+    row_totals = rows.sum(dim=1)
+    if bool((row_totals <= 0).any()):
+        raise ValueError("every attention row must have positive candidate mass")
+    retained = rows.index_select(1, keep).sum(dim=1)
+    return float((retained / row_totals).mean())
+
+
 def candidate_regions(block: dict[str, Any]) -> list[dict[str, Any]]:
     """Candidate-space spans after removing the current block itself."""
     prompt = int(block["prompt_length"])
@@ -653,22 +675,28 @@ def attach_budget_results(payload: dict[str, Any], cache_budget: int) -> list[di
     metric_rows = []
     for block in payload["blocks"]:
         current_keeps, ours_keeps, oracle_keeps = [], [], []
-        current_masses, ours_masses = [], []
+        current_attention_masses, ours_attention_masses = [], []
+        current_utility_masses, ours_utility_masses = [], []
         current_recalls, ours_recalls = [], []
         for layer in range(int(payload["layer_count"])):
             future = block["future_score"][layer].float()
-            current_keep, current_mass, current_recall = topk_metrics(
+            future_rows = block["future_attention_rows"][layer].float()
+            current_keep, current_utility_mass, current_recall = topk_metrics(
                 block["current_score"][layer], future, cache_budget
             )
-            ours_keep, ours_mass, ours_recall = topk_metrics(
+            ours_keep, ours_utility_mass, ours_recall = topk_metrics(
                 block["predicted_score"][layer], future, cache_budget
             )
+            current_attention_mass = attention_mass_at_k(future_rows, current_keep)
+            ours_attention_mass = attention_mass_at_k(future_rows, ours_keep)
             oracle_keep = torch.topk(future, cache_budget).indices.sort().values.cpu()
             current_keeps.append(current_keep)
             ours_keeps.append(ours_keep)
             oracle_keeps.append(oracle_keep)
-            current_masses.append(current_mass)
-            ours_masses.append(ours_mass)
+            current_attention_masses.append(current_attention_mass)
+            ours_attention_masses.append(ours_attention_mass)
+            current_utility_masses.append(current_utility_mass)
+            ours_utility_masses.append(ours_utility_mass)
             current_recalls.append(current_recall)
             ours_recalls.append(ours_recall)
             metric_rows.append({
@@ -676,16 +704,20 @@ def attach_budget_results(payload: dict[str, Any], cache_budget: int) -> list[di
                 "layer_index": layer,
                 "candidate_count": int(future.numel()),
                 "cache_budget": cache_budget,
-                "current_mass_at_k": current_mass,
-                "ours_mass_at_k": ours_mass,
+                "current_attention_mass_at_k": current_attention_mass,
+                "ours_attention_mass_at_k": ours_attention_mass,
                 "current_recall_at_k": current_recall,
                 "ours_recall_at_k": ours_recall,
+                "current_utility_mass_at_k": current_utility_mass,
+                "ours_utility_mass_at_k": ours_utility_mass,
             })
         block["current_keep"] = torch.stack(current_keeps)
         block["ours_keep"] = torch.stack(ours_keeps)
         block["oracle_keep"] = torch.stack(oracle_keeps)
-        block["current_mass_at_k"] = torch.tensor(current_masses)
-        block["ours_mass_at_k"] = torch.tensor(ours_masses)
+        block["current_attention_mass_at_k"] = torch.tensor(current_attention_masses)
+        block["ours_attention_mass_at_k"] = torch.tensor(ours_attention_masses)
+        block["current_utility_mass_at_k"] = torch.tensor(current_utility_masses)
+        block["ours_utility_mass_at_k"] = torch.tensor(ours_utility_masses)
         block["current_recall_at_k"] = torch.tensor(current_recalls)
         block["ours_recall_at_k"] = torch.tensor(ours_recalls)
     payload["cache_budget"] = cache_budget
@@ -926,8 +958,18 @@ def render_figure(
         colorbar.set_ticks(np.linspace(0.0, color_max, 4))
         colorbar.ax.tick_params(labelsize=6.5, length=2, pad=1)
 
-    mass_current = float(np.mean([row["current_mass_at_k"] for row in metric_rows]))
-    mass_ours = float(np.mean([row["ours_mass_at_k"] for row in metric_rows]))
+    attention_mass_current = float(np.mean([
+        row["current_attention_mass_at_k"] for row in metric_rows
+    ]))
+    attention_mass_ours = float(np.mean([
+        row["ours_attention_mass_at_k"] for row in metric_rows
+    ]))
+    utility_mass_current = float(np.mean([
+        row["current_utility_mass_at_k"] for row in metric_rows
+    ]))
+    utility_mass_ours = float(np.mean([
+        row["ours_utility_mass_at_k"] for row in metric_rows
+    ]))
     recall_current = float(np.mean([row["current_recall_at_k"] for row in metric_rows]))
     recall_ours = float(np.mean([row["ours_recall_at_k"] for row in metric_rows]))
     x = np.arange(2)
@@ -937,15 +979,15 @@ def render_figure(
         label="_nolegend_", zorder=1,
     )
     current_bars = metric_axis.bar(
-        x - width / 2, [mass_current, recall_current], width,
+        x - width / 2, [attention_mass_current, recall_current], width,
         color="#4C78A8", label="Sparse-dLLM"
     )
     ours_bars = metric_axis.bar(
-        x + width / 2, [mass_ours, recall_ours], width,
+        x + width / 2, [attention_mass_ours, recall_ours], width,
         color="#1B9E77", label="Preview-dLLM"
     )
     metric_axis.set_xticks(
-        x, ["Utility\nMass@K", f"{reference_label}\nRecall@K"]
+        x, ["Attention\nMass@K", f"{reference_label}\nRecall@K"]
     )
     metric_axis.set_ylim(0.0, 1.05)
     metric_axis.set_ylabel("Score ↑", fontsize=8.0, labelpad=4)
@@ -1043,15 +1085,29 @@ def render_figure(
         "actual_keep_ratio": actual_keep_ratio,
         "evicted_ratio": evicted_ratio,
         "averaging_units": len(metric_rows),
+        "metric_definitions": {
+            "attention_mass_at_k": (
+                "mean over completed-block query tokens of retained candidate "
+                "attention divided by total candidate attention"
+            ),
+            "oracle_recall_at_k": (
+                "intersection of method Top-K and row-max utility Top-K, divided by K"
+            ),
+            "utility_mass_at_k_analysis_only": (
+                "sum of row-max utility at method Top-K divided by total row-max utility"
+            ),
+        },
         "full_cache_reference": {
-            "future_mass": 1.0,
-            "future_recall": 1.0,
+            "attention_mass": 1.0,
+            "oracle_recall": 1.0,
         },
         "average": {
-            "current_mass_at_k": mass_current,
-            "ours_mass_at_k": mass_ours,
+            "current_attention_mass_at_k": attention_mass_current,
+            "ours_attention_mass_at_k": attention_mass_ours,
             "current_recall_at_k": recall_current,
             "ours_recall_at_k": recall_ours,
+            "current_utility_mass_at_k": utility_mass_current,
+            "ours_utility_mass_at_k": utility_mass_ours,
         },
         "selected_layer_block": {
             key: value for key, value in selected_row.items()

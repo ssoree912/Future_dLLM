@@ -13,11 +13,16 @@
   student 점수입니다.
 
 기본 정성 패널은 미리 고정한 layer index 24와 두 번째 generation block을
-사용합니다. 오른쪽 Utility-Mass@K/Oracle-Recall@K는 해당 샘플의 모든 layer와 모든 block을
+사용합니다. 오른쪽 Attention-Mass@K/Oracle-Recall@K는 해당 샘플의 모든 layer와 모든 block을
 평균합니다. `--keep-ratio 0.1`이면 후보 수의 10%를 Top-K budget으로 사용하며,
-오른쪽 점선 `Full cache (1.0)`을 기준으로 그 작은 캐시에 미래 attention mass와
+오른쪽 점선 `Full cache (1.0)`을 기준으로 그 작은 캐시에 실제 attention mass와
 oracle Top-K가 얼마나 남는지 보여줍니다. 정수 K를 내림하므로 실제 유지 비율은
 후보 수에 따라 10%보다 조금 작을 수 있습니다.
+
+Attention-Mass@K는 completed-block query row마다 선택된 K개 열의 attention 합을
+전체 candidate attention 합으로 나눈 뒤 query token 방향으로 평균합니다. 따라서
+row-max teacher label과 독립적이며 full cache 값은 정의상 1입니다. 기존 row-max
+기반 Utility-Mass@K는 label 분석용으로 `metrics.csv`와 `summary.json`에만 남깁니다.
 
 ```bash
 conda activate future-dllm
@@ -39,7 +44,8 @@ activation용으로 남기고 일부 model layer를 CPU에 배치합니다. 전�
 - `figure_1.png`, `figure_1.pdf`: 논문용 정성/정량 패널
 - `analysis.pt`: current score, token별 future attention, row-max oracle,
   prediction, 세 Top-K 집합을 포함한 원자료
-- `metrics.csv`: block/layer별 Utility-Mass@K와 Oracle-Recall@K
+- `metrics.csv`: block/layer별 Attention-Mass@K, Oracle-Recall@K와 분석용
+  Utility-Mass@K
 - `summary.json`: 전체 평균과 선택한 정성 패널의 수치
 
 ## MultiNews paper figure
