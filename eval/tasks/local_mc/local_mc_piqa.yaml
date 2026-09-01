@@ -5,10 +5,8 @@ task: local_mc_piqa
 dataset_path: parquet
 dataset_kwargs:
   data_files:
-    train: DATA_DIR/train/piqa/train.parquet
     validation: DATA_DIR/eval/piqa/validation.parquet
 output_type: multiple_choice
-training_split: train
 validation_split: validation
 test_split: null
 doc_to_text: "Question: {{goal}}\nAnswer:"
