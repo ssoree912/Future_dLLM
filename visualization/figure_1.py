@@ -106,7 +106,7 @@ def topk_metrics(
     future_score: torch.Tensor,
     cache_budget: int,
 ) -> tuple[torch.Tensor, float, float]:
-    """Return kept indices, Future-Mass@K, and Oracle-Recall@K."""
+    """Return kept indices, Oracle-Mass@K, and Oracle-Recall@K."""
     predicted_score = predicted_score.flatten().float()
     future_score = future_score.flatten().float()
     if predicted_score.shape != future_score.shape:
@@ -945,7 +945,7 @@ def render_figure(
         color="#1B9E77", label="Preview-dLLM"
     )
     metric_axis.set_xticks(
-        x, ["Future\nMass@K", f"{reference_label}\nRecall@K"]
+        x, [f"{reference_label}\nMass@K", f"{reference_label}\nRecall@K"]
     )
     metric_axis.set_ylim(0.0, 1.05)
     metric_axis.set_ylabel("Score ↑", fontsize=8.0, labelpad=4)
