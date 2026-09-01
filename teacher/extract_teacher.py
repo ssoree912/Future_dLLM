@@ -11,9 +11,8 @@ maximum rather than the sum is what makes the label usable: summing averages awa
 the one token that depended on a given cache entry.
 
 Stored per (sample, block): the label [n_layers, n_candidates], the exact model
-input at the block's cache-selection step so the scorer's features can be
-replayed at training time without keeping hidden states, and the candidate index
-set.
+input at the block's step-1 so the scorer's features can be replayed at training
+time without keeping hidden states, and the candidate index set.
 """
 
 from __future__ import annotations
@@ -104,7 +103,7 @@ def collect(model, prompt_ids, args):
         ntt = get_num_transfer_tokens(x[:, bs:be] == MASK_ID, S)
 
         def step(i):
-            state = 1 if i == 0 else 2
+            state = 2 if i > 1 else i
             inp = x if state != 2 else x[:, bs:be]
             m = (inp == MASK_ID)
             logits = model(inp, bs, state, cache).logits
@@ -119,9 +118,14 @@ def collect(model, prompt_ids, args):
             keep = torch.topk(conf[0], k=ntt[0, i]).indices
             tgt[0, keep] = x0[0, keep]
 
-        # This is the exact input entering the first-step cache selection.
-        x_at_block_start = x.clone()
-        for i in range(S):
+        # Step 1 runs forward, prunes, and only then reveals, so the state the
+        # scorer sees at selection time is the one *entering* step 1 - after
+        # step 0's reveal, before step 1's. Cloning after step(1) would hand
+        # training one revealed token more than deployment ever has.
+        step(0)
+        x_at_block_start = x.clone()          # the scorer's input at selection time
+        step(1)
+        for i in range(2, S):
             step(i)
 
         # One more forward on the completed block: all rows are real tokens now.
@@ -151,7 +155,6 @@ def collect(model, prompt_ids, args):
             "prompt_length": int(P),
             "gen_length": G,
             "steps_per_block": S,
-            "cache_selection_step": 0,
             "x_at_block_start": x_at_block_start[0].cpu(),
             "candidate_indices": candidates.cpu(),
             "label_final_rowmax": label.to(torch.float16).cpu(),
@@ -205,8 +208,6 @@ def main():
             if (blocks
                     and all(int(r.get("prompt_length", -1)) == expected_prompt_len
                             and int(r.get("gen_length", -1)) == args.gen_length
-                            and r.get("cache_selection_step",
-                                      r.get("cache_delay_steps")) == 0
                             and r["x_at_block_start"].numel()
                             == expected_prompt_len + args.gen_length
                             and (not args.save_attention_rows
@@ -222,7 +223,6 @@ def main():
                    "prompt_limit": args.prompt_limit,
                    "gen_length": args.gen_length,
                    "max_seq_len": args.max_seq_len,
-                   "cache_selection_step": 0,
                    "teacher_kind": "final_rowmax",
                    "attention_rows_saved": args.save_attention_rows,
                    "blocks": records}

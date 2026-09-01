@@ -34,7 +34,7 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-printf 'default student training\nmodel=%s\nteacher=%s\nmax_seq_len=%s\ncache_selection_step=0\nrun=%s\nlog=%s\n' \
+printf 'default student training\nmodel=%s\nteacher=%s\nmax_seq_len=%s\nrun=%s\nlog=%s\n' \
   "$MODEL" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "$RUN_NAME" "$LOG_FILE"
 
 "$PY" "$REPO/student/train_student.py" \

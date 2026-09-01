@@ -77,9 +77,6 @@ python scripts/download_data.py --parts longbench
 scripts/extract_default_teacher.sh
 ```
 
-캐시는 각 generation block의 첫 step에서 선택합니다. 별도의 warm-up 또는
-지연된 선택 단계는 사용하지 않습니다.
-
 | 데이터셋 | 프롬프트 | 생성 길이 | teacher 블록 |
 |---|---:|---:|---:|
 | `math5s` | 500 | 256 | 8 |
@@ -113,7 +110,7 @@ scripts/train_default_student.sh
 ```bash
 python student/train_student.py --teacher-root artifacts/teacher/samsum
 ```
-sample ckpt : https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_nodelay0_5ds_500-371-150-100-500_e10_lr2e-4_20260831_111201_best6.zip
+sample ckpt : https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip
 
 
 ## 추론
@@ -132,5 +129,4 @@ MAX_SEQ_LEN=10240 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/check
 
 # 길이 일반화 비교가 필요하면 프롬프트만의 상한도 별도로 선택
 MAX_SEQ_LEN=4096 MAX_PROMPT_LEN=2048 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/checkpoint-best
-
 ```
