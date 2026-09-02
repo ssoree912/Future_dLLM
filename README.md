@@ -47,23 +47,43 @@ python scripts/download_data.py --parts train
 python scripts/download_data.py --parts longbench
 ```
 
-## 데이터셋
+## 평가 데이터셋
 
-| 데이터셋 | 출처(테스트가 아닌 split) | 평가 태스크 | teacher `--gen-length` |
-|---|---|---|---|
-| `samsum` | LongBench samsum 대화 | `longbench_samsum` | 128 |
-| `gsm8k` | gsm8k train | `local_gsm8k`, 5-shot | 256 |
-| `mmlu` | mmlu validation + dev | `local_mc_mmlu`, 5-shot | 64 |
-| `math` | hendrycks_math train | `local_math` | 256 |
-| `mbpp` | mbpp validation + prompt | 프롬프트 샤드만 | 128 |
-| `mbpp_full` | mbpp 전체 train | `mbpp` | 256 |
-| `samsum_lb` / `trec_lb` / `wiki2_lb` | LongBench 형식, 약 2048 토큰 프롬프트 | `longbench_*` | 128 / 64 / 32 |
-| `musique` / `qasper` / `gov_report` / `repobench_p` | LongBench 원본 train | `longbench_*` | 32 / 128 / 512 / 64 |
-| `arc_c` | ARC-Challenge train | `local_mc_arc_challenge`, 25-shot | teacher 미지원 |
-| `piqa` | PIQA train | `local_mc_piqa` | teacher 미지원 |
-| `gpqa` | GPQA main | `local_mc_gpqa_main_n_shot`, 5-shot | teacher 미지원 |
-| `math500` | MATH-500 test | `local_math500` | teacher 미지원 |
-| `humaneval` | HumanEval test | `local_humaneval` | teacher 미지원 |
+생성 길이는 태스크 yaml 의 `generation_kwargs.max_gen_toks` 이고, 값이 없는 태스크는
+lm-eval 의 `HFLM.max_gen_toks` 기본값 256 을 씁니다 (`eval/lm_eval_model.py:49`).
+denoising step 은 토큰당 1 회이므로 step 수 = 생성 길이입니다. 프롬프트 예산은
+`max_seq_len - 생성 길이` 이며, 기본 `max_seq_len` 은 4096 입니다.
+
+| 데이터셋 | 생성 길이 |
+|---|---:|
+| `gov_report` / `multi_news` / `qmsum` | 512 |
+| `samsum` / `qasper` / `narrativeqa` | 128 |
+| `trec` / `lcc` / `repobench-p` / `multifieldqa_en` | 64 |
+| `triviaqa` / `2wikimqa` / `hotpotqa` / `musique` / `passage_retrieval_en` / `passage_count` | 32 |
+| `gsm8k` (5-shot) | 256 * |
+| `math` (4-shot) | 256 * |
+| `math500` (4-shot) | 256 * |
+| `humaneval` | 1024 |
+| `mmlu` (5-shot) / `arc_c` (25-shot) / `piqa` / `gpqa` (5-shot) | 생성 없음 ** |
+
+`*` yaml 에 `max_gen_toks` 가 없어 lm-eval 기본값 256 이 적용된 항목입니다.
+`**` 4지선다 loglikelihood 로 채점하므로 아무것도 생성하지 않습니다.
+
+## 학습 데이터셋
+
+teacher 라벨을 뽑는 5개 도메인입니다 (`scripts/extract_default_teacher.sh:15-16`).
+생성 길이는 각 데이터셋이 학습 대상으로 삼는 평가 태스크의 `max_gen_toks` 를 그대로
+따라갑니다 — `teacher/gen_length.py` 가 평가 yaml 에서 읽어오므로 둘이 어긋나지 않습니다.
+
+| 데이터셋 | 샘플 수 | 생성 길이 | 프롬프트 상한 | teacher 블록 | 생성 길이 출처 |
+|---|---:|---:|---:|---:|---|
+| `math5s` | 500 | 256 | 3,840 | 8 | `local/math.yaml` 미설정 → 기본값 |
+| `mbpp_full` | 371 | 256 | 3,840 | 8 | 평가 태스크 없음 → repo 기본값 |
+| `gov_report` | 150 | 512 | 3,584 | 16 | `longbench/gov_report.yaml` |
+| `multi_news` | 100 | 512 | 3,584 | 16 | `longbench/multi_news.yaml` |
+| `musique` | 500 | 32 | 4,064 | 1 | `longbench/musique.yaml` |
+
+teacher 블록 = 생성 길이 / block_length(32). 프롬프트 상한 = 4096 − 생성 길이.
 
 
 
@@ -77,14 +97,8 @@ python scripts/download_data.py --parts longbench
 scripts/extract_default_teacher.sh
 ```
 
-| 데이터셋 | 프롬프트 | 생성 길이 | teacher 블록 |
-|---|---:|---:|---:|
-| `math5s` | 500 | 256 | 8 |
-| `mbpp_full` | 371 | 256 | 8 |
-| `musique` | 1,600 | 32 | 1 |
-| `gov_report` | 150 | 512 | 16 |
-| `repobench_p` | 800 | 64 | 2 |
-
+데이터셋별 샘플 수·생성 길이·프롬프트 상한·블록 수는 위 [학습 데이터셋](#학습-데이터셋)
+표를 참고하십시오.
 
 개별 데이터셋만 추출
 
