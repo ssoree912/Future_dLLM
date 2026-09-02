@@ -49,10 +49,7 @@ python scripts/download_data.py --parts longbench
 
 ## 평가 데이터셋
 
-생성 길이는 태스크 yaml 의 `generation_kwargs.max_gen_toks` 이고, 값이 없는 태스크는
-lm-eval 의 `HFLM.max_gen_toks` 기본값 256 을 씁니다 (`eval/lm_eval_model.py:49`).
-denoising step 은 토큰당 1 회이므로 step 수 = 생성 길이입니다. 프롬프트 예산은
-`max_seq_len - 생성 길이` 이며, 기본 `max_seq_len` 은 4096 입니다.
+ `max_seq_len` :  4096 
 
 | 데이터셋 | 생성 길이 |
 |---|---:|
@@ -66,23 +63,18 @@ denoising step 은 토큰당 1 회이므로 step 수 = 생성 길이입니다. �
 | `humaneval` | 1024 |
 | `mmlu` (5-shot) / `arc_c` (25-shot) / `piqa` / `gpqa` (5-shot) | 생성 없음 ** |
 
-`*` yaml 에 `max_gen_toks` 가 없어 lm-eval 기본값 256 이 적용된 항목입니다.
 `**` 4지선다 loglikelihood 로 채점하므로 아무것도 생성하지 않습니다.
 
 ## 학습 데이터셋
 
-teacher 라벨을 뽑는 5개 도메인입니다 (`scripts/extract_default_teacher.sh:15-16`).
-생성 길이는 각 데이터셋이 학습 대상으로 삼는 평가 태스크의 `max_gen_toks` 를 그대로
-따라갑니다 — `teacher/gen_length.py` 가 평가 yaml 에서 읽어오므로 둘이 어긋나지 않습니다.
 
-| 데이터셋 | 샘플 수 | 생성 길이 | 프롬프트 상한 | teacher 블록 | 생성 길이 출처 |
+| 데이터셋 | 샘플 수 | 생성 길이 | 프롬프트 상한 | teacher 블록 | 
 |---|---:|---:|---:|---:|---|
-| `math5s` | 500 | 256 | 3,840 | 8 | `local/math.yaml` 미설정 → 기본값 |
-| `mbpp_full` | 371 | 256 | 3,840 | 8 | 평가 태스크 없음 → repo 기본값 |
-| `gov_report` | 150 | 512 | 3,584 | 16 | `longbench/gov_report.yaml` |
-| `multi_news` | 100 | 512 | 3,584 | 16 | `longbench/multi_news.yaml` |
-| `musique` | 500 | 32 | 4,064 | 1 | `longbench/musique.yaml` |
-
+| `math5s` | 500 | 256 | 3,840 | 8 | 
+| `mbpp_full` | 371 | 256 | 3,840 | 8 | 
+| `gov_report` | 150 | 512 | 3,584 | 16 | 
+| `multi_news` | 100 | 512 | 3,584 | 16 | 
+| `musique` | 500 | 32 | 4,064 | 1 | 
 teacher 블록 = 생성 길이 / block_length(32). 프롬프트 상한 = 4096 − 생성 길이.
 
 
@@ -124,7 +116,7 @@ scripts/train_default_student.sh
 ```bash
 python student/train_student.py --teacher-root artifacts/teacher/samsum
 ```
-sample ckpt : https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip
+sample ckpt : [https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip](https://huggingface.co/solhee/future-dllm-scorer/blob/main/checkpoint-best.zip)
 
 
 ## 추론
