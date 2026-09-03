@@ -60,7 +60,7 @@ python scripts/download_data.py --parts longbench
 | `gsm8k` (5-shot) | 256 * |
 | `math` (4-shot) | 256 * |
 | `math500` (4-shot) | 256 * |
-| `humaneval` | 1024 |
+| `humaneval` | 512 |
 | `mmlu` (5-shot) / `arc_c` (25-shot) / `piqa` / `gpqa` (5-shot) | 생성 없음 ** |
 
 `**` 4지선다 loglikelihood 로 채점하므로 아무것도 생성하지 않습니다.
