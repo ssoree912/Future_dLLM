@@ -13,6 +13,19 @@ the one token that depended on a given cache entry.
 Stored per (sample, block): the label [n_layers, n_candidates], the exact model
 input at the block's step-1 so the scorer's features can be replayed at training
 time without keeping hidden states, and the candidate index set.
+
+Shared implementation -- not runnable on its own. Use the family entry points:
+
+    teacher/extract_teacher_llada.py --model model/LLaDA-8B-Instruct --dataset ...
+    teacher/extract_teacher_dream.py --model model/Dream-v0-Instruct-7B --dataset ...
+
+Each pins one family and refuses a checkpoint from the other, so a run cannot
+silently label with the wrong model. The label itself lives here and is shared:
+one extra forward on the completed block, per-candidate row-max over the block's
+rows, over a candidate pool that is the block's complement for both families
+(and so the same pool the Sparse-dLLM baseline scores). LLaDA and Dream differ
+only in the mask token, Dream's autoregressive logit shift, and whether step 0
+seeds the block's first token -- see future_dllm/backends.py.
 """
 
 from __future__ import annotations
@@ -31,12 +44,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_length import resolve as resolve_gen_length
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MASK_ID = 126336
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default=str(REPO_ROOT / "model" / "LLaDA-8B-Instruct"))
+def parse_args(family, description):
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument("--model", required=True,
+                   help=f"path to the {family} checkpoint to label with. Required "
+                        f"on purpose: teacher labels are only meaningful for the "
+                        f"model that produced them, so the run always says which "
+                        f"one it used")
     p.add_argument("--dataset", required=True,
                    help="prompt shard directory name, e.g. samsum / gsm8k / mmlu")
     p.add_argument("--shard-root", default=str(REPO_ROOT / "artifacts" / "prompt_shards"))
@@ -55,6 +71,19 @@ def parse_args():
         help="analysis only: also save completed-block attention before row-max",
     )
     args = p.parse_args()
+
+    # Refuse a checkpoint from the other family outright. Without this a Dream
+    # path handed to the LLaDA entry point would just load as Dream and write
+    # labels that look fine and belong to the wrong model.
+    from future_dllm import detect_family
+    found = detect_family(args.model)
+    if found != family:
+        raise SystemExit(
+            f"this script extracts {family} labels, but --model {args.model} is "
+            f"a {found} checkpoint. Use teacher/extract_teacher_{found}.py instead."
+        )
+    args.family = family
+
     if args.gen_length is None:
         args.gen_length, source = resolve_gen_length(args.dataset)
         print(f"gen_length {args.gen_length} from {source}", flush=True)
@@ -80,7 +109,7 @@ def parse_args():
 
 
 @torch.no_grad()
-def collect(model, prompt_ids, args):
+def collect(model, prompt_ids, args, backend):
     from future_dllm import CustomCache, add_gumbel_noise, get_num_transfer_tokens
 
     device = model.device
@@ -90,7 +119,7 @@ def collect(model, prompt_ids, args):
     G, B = args.gen_length, args.block_length
     n_blocks = G // B
     S = args.gen_length // n_blocks          # steps per block == block length
-    L = model.config.n_layers
+    L, MASK_ID = backend.n_layers, backend.mask_id
 
     x = torch.full((1, P + G), MASK_ID, dtype=torch.long, device=device)
     x[:, :P] = prompt_ids
@@ -107,6 +136,10 @@ def collect(model, prompt_ids, args):
             inp = x if state != 2 else x[:, bs:be]
             m = (inp == MASK_ID)
             logits = model(inp, bs, state, cache).logits
+            if backend.logit_shift:
+                # Dream row r predicts token r+1; move each row onto the position
+                # it describes, exactly as Dream's own generation_utils does.
+                logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
             x0 = torch.argmax(add_gumbel_noise(logits, 0.0), dim=-1)
             conf = torch.squeeze(torch.gather(F.softmax(logits, -1), -1,
                                               x0.unsqueeze(-1)), -1)
@@ -115,6 +148,12 @@ def collect(model, prompt_ids, args):
                 conf[:, be:] = -float("inf")
             x0 = torch.where(m, x0, tgt)
             conf = torch.where(m, conf, torch.full_like(conf, -float("inf")))
+            if state == 0 and backend.seed_block_start:
+                # The block's first token is only readable on a full forward
+                # under the shift, so it is confirmed here. +inf heads this
+                # step's top-k rather than adding a reveal: the budget is
+                # unchanged, only which token it spends its first pick on.
+                conf[:, bs] = float("inf")
             keep = torch.topk(conf[0], k=ntt[0, i]).indices
             tgt[0, keep] = x0[0, keep]
 
@@ -146,12 +185,22 @@ def collect(model, prompt_ids, args):
         cache.pending_rows.clear()
         cache.capture_rows = False
 
+        # Candidates are everything outside the block, in cache order -- exactly
+        # what CustomCache.filter_cache keeps, so the label columns line up with
+        # the entries the student will score.
         candidates = torch.cat([torch.arange(bs, device=device),
                                 torch.arange(be, x.shape[1], device=device)])
         record = {
             "block_index": block,
             "block_start": int(bs),
             "block_length": B,
+            # The window the cache was cut around; the student conditions on it.
+            # Identical to the block for both backends today, and recorded
+            # explicitly so a future backend that widens it stays readable.
+            "window_start": int(bs),
+            "window_length": int(B),
+            "seed_block_start": bool(backend.seed_block_start),
+            "backend": backend.name,
             "prompt_length": int(P),
             "gen_length": G,
             "steps_per_block": S,
@@ -170,22 +219,23 @@ def collect(model, prompt_ids, args):
     return records
 
 
-def main():
-    args = parse_args()
+def run(family, description):
+    """Entry point body, called by the two family scripts."""
     sys.path.insert(0, str(REPO_ROOT))
-    from transformers import AutoConfig
-    from future_dllm import LLaDAModelLM
+    args = parse_args(family, description)
+    from future_dllm import load_model
 
-    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    native_limit = int(getattr(cfg, "max_sequence_length", args.max_seq_len))
-    if args.max_seq_len > native_limit:
+    # keep_ratio=1.0: the teacher labels the whole candidate pool, so nothing is
+    # evicted while it runs. load_model injects block_len and keep_ratio onto
+    # the config, which is what the patched attention reads at selection time.
+    model, backend = load_model(args.model, max_seq_len=args.max_seq_len,
+                                block_length=args.block_length, keep_ratio=1.0)
+    if args.max_seq_len > backend.native_max_seq_len:
         print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
-              f"trained context {native_limit}", flush=True)
-    cfg.max_sequence_length = args.max_seq_len
-    cfg.block_len, cfg.keep_ratio = args.block_length, 1.0
-    model = LLaDAModelLM.from_pretrained(args.model, config=cfg, device_map="auto",
-                                         torch_dtype=torch.bfloat16,
-                                         trust_remote_code=True).eval()
+              f"trained context {backend.native_max_seq_len}", flush=True)
+    print(f"backend={backend.name} layers={backend.n_layers} "
+          f"mask_id={backend.mask_id} logit_shift={backend.logit_shift} "
+          f"seed_block_start={backend.seed_block_start}", flush=True)
 
     out = Path(args.output_root) / args.dataset
     out.mkdir(parents=True, exist_ok=True)
@@ -205,7 +255,11 @@ def main():
         if target.exists():
             saved = torch.load(target, map_location="cpu", weights_only=False)
             blocks = saved.get("blocks") or []
+            # The backend check matters as much as the lengths: a Dream and a
+            # LLaDA shard for the same sample can agree on every length and
+            # still hold labels from different models over different vocabs.
             if (blocks
+                    and saved.get("backend", backend.name) == backend.name
                     and all(int(r.get("prompt_length", -1)) == expected_prompt_len
                             and int(r.get("gen_length", -1)) == args.gen_length
                             and r["x_at_block_start"].numel()
@@ -216,9 +270,11 @@ def main():
                 continue
             print(f"rebuilding mismatched teacher shard: {target.name}", flush=True)
         added += 1
-        records = collect(model, prompt_ids, args)
+        records = collect(model, prompt_ids, args, backend)
         payload = {"sample_id": src.get("sample_id"),
                    "dataset": args.dataset,
+                   "backend": backend.name,
+                   "model": str(args.model),
                    "prompt_input_ids": prompt_ids,
                    "prompt_limit": args.prompt_limit,
                    "gen_length": args.gen_length,
@@ -238,4 +294,9 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        "extract_teacher.py holds the shared implementation and is not runnable "
+        "on its own -- the family decides the mask token, the logit shift and "
+        "the step-0 seed. Use teacher/extract_teacher_llada.py or "
+        "teacher/extract_teacher_dream.py."
+    )

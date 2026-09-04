@@ -95,8 +95,11 @@ scripts/extract_default_teacher.sh
 개별 데이터셋만 추출
 
 ```bash
-python teacher/build_prompt_shards.py --dataset samsum --limit 300 --max-seq-len 4096
-python teacher/extract_teacher.py     --dataset samsum --n-samples 300 --max-seq-len 4096
+python teacher/build_prompt_shards.py    --model model/LLaDA-8B-Instruct --dataset samsum --limit 300 --max-seq-len 4096
+python teacher/extract_teacher_llada.py --model model/LLaDA-8B-Instruct --dataset samsum --n-samples 300 --max-seq-len 4096
+
+# Dream 은 같은 인자에 전용 스크립트만 바꿔 씁니다.
+python teacher/extract_teacher_dream.py --model model/Dream-v0-Instruct-7B --dataset samsum --n-samples 300 --max-seq-len 4096
 ```
 
 teacher 추출과 student 학습은 total 4096을 기준으로 합니다. 4096을 넘는
@@ -114,7 +117,7 @@ scripts/train_default_student.sh
 개별 구성 학습
 
 ```bash
-python student/train_student.py --teacher-root artifacts/teacher/samsum
+python student/train_student.py --model model/LLaDA-8B-Instruct --teacher-root artifacts/teacher/samsum
 ```
 sample ckpt : [https://huggingface.co/solhee/future-dllm-scorer/blob/main/default_5ds_500-371-150-100-500_e15_lr2e-4_20260827_002758_best10.zip](https://huggingface.co/solhee/future-dllm-scorer/blob/main/checkpoint-best.zip)
 

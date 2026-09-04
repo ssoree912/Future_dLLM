@@ -318,7 +318,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", choices=sorted(BUILDERS), required=True)
     p.add_argument("--limit", type=int, default=300)
-    p.add_argument("--model", default=str(REPO_ROOT / "model" / "LLaDA-8B-Instruct"))
+    p.add_argument("--model", required=True,
+                   help="tokenizer source; required so a run always says which "
+                        "model it tokenised for. Shards are NOT interchangeable "
+                        "between families: Dream's Qwen2 chat template and "
+                        "vocabulary give different ids and lengths than LLaDA's, "
+                        "and the resume check only compares lengths, so give each "
+                        "family its own --out-root")
     p.add_argument("--max-seq-len", type=int, default=4096,
                    help="maximum prompt + generation length (default: 4096)")
     p.add_argument("--gen-length", type=int, default=None,
