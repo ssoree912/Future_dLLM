@@ -10,6 +10,11 @@ Targets are ranking targets, so the loss is listwise (KL against the normalised
 label, weighted by --lambda-list) plus a pairwise term sampled across the whole
 range, and checkpoints are selected on mean recall over a k-grid rather than any
 single budget.
+
+Backend-agnostic: the replay forward goes through future_dllm.load_model, so the
+same trainer covers LLaDA and Dream. The block the scorer conditions on is read
+off the teacher record rather than assumed here, so a backend that ever cuts its
+cache around something wider than the block stays loadable.
 """
 
 from __future__ import annotations
@@ -26,7 +31,12 @@ import torch.nn.functional as F
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default=str(REPO_ROOT / "model" / "LLaDA-8B-Instruct"))
+    p.add_argument("--model", required=True,
+                   help="the checkpoint the teacher labels were extracted with. "
+                        "Required, and checked against the shards: the replay "
+                        "forward has to reproduce the hidden states the selection "
+                        "was made from, so a different model trains on states "
+                        "deployment never sees")
     p.add_argument("--teacher-root", default=str(REPO_ROOT / "artifacts/teacher/samsum"),
                    help="comma-separated for mixed-domain training: val is split "
                         "per domain and the checkpoint is chosen on the domain "
@@ -41,6 +51,9 @@ def parse_args():
     p.add_argument("--mlp-dim", type=int, default=512)
     p.add_argument("--val-ratio", type=float, default=0.1)
     p.add_argument("--pairs", type=int, default=4096)
+    p.add_argument("--block-length", type=int, default=32,
+                   help="must match the teacher run; only used to size the "
+                        "replay forward's cache window")
     p.add_argument("--max-seq-len", type=int, default=4096,
                    help="reject teacher records longer than this total sequence length")
     p.add_argument("--lambda-list", type=float, default=1.0,
@@ -78,6 +91,20 @@ def checkpoint_name(datasets, counts, epochs, lr):
             f"_lr{lr_text}_blk_{tag}")
 
 
+def window_start(record):
+    """Where the cache was cut for this block.
+
+    Both backends cut around the block itself today, so this is the block --
+    recorded explicitly so a backend that ever widens its window stays readable,
+    and defaulted for teacher shards written before the key existed.
+    """
+    return int(record.get("window_start", record["block_start"]))
+
+
+def window_length(record):
+    return int(record.get("window_length", record["block_length"]))
+
+
 def load_shard(path, attempts=3):
     """The NAS the shards live on throws transient EIO under load; one of those
     five hours into a run must not kill it."""
@@ -96,22 +123,17 @@ def main():
         raise SystemExit("--max-seq-len must be positive")
     torch.manual_seed(args.seed); random.seed(args.seed)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from transformers import AutoConfig
-    from future_dllm import LLaDAModelLM, CustomCache
+    from future_dllm import CustomCache, load_model
 
-    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    native_limit = int(getattr(cfg, "max_sequence_length", args.max_seq_len))
-    if args.max_seq_len > native_limit:
+    model, backend = load_model(args.model, max_seq_len=args.max_seq_len,
+                                block_length=args.block_length, keep_ratio=1.0)
+    if args.max_seq_len > backend.native_max_seq_len:
         print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
-              f"trained context {native_limit}", flush=True)
-    cfg.max_sequence_length = args.max_seq_len
-    cfg.block_len, cfg.keep_ratio = 32, 1.0
-    model = LLaDAModelLM.from_pretrained(args.model, config=cfg, device_map="auto",
-                                         torch_dtype=torch.bfloat16,
-                                         trust_remote_code=True).eval()
+              f"trained context {backend.native_max_seq_len}", flush=True)
     for p in model.parameters():
         p.requires_grad_(False)
-    device, L, H = model.device, model.config.n_layers, model.config.d_model
+    device, L, H = model.device, backend.n_layers, backend.hidden_dim
+    print(f"backend={backend.name} layers={L} hidden={H}", flush=True)
 
     # Capture has to stay on so training sees the same hidden states deployment
     # will hand the scorer.
@@ -135,11 +157,24 @@ def main():
             if cap > len(found):
                 raise SystemExit(f"{name}: asked for {cap} prompts, only {len(found)} exist")
             found = found[:cap]
+        # The labels only mean anything for the model that produced them, and
+        # nothing downstream would notice the mismatch: a LLaDA shard trained
+        # against Dream just replays a different vocabulary's ids and quietly
+        # learns to rank the wrong candidates.
+        head = load_shard(found[0])
+        shard_backend = head.get("backend")
+        if shard_backend is not None and shard_backend != backend.name:
+            raise SystemExit(
+                f"{name}: teacher labels were extracted with {shard_backend} "
+                f"({head.get('model', 'unknown checkpoint')}), but --model is a "
+                f"{backend.name} checkpoint. Pass the model the labels came from."
+            )
         split = max(1, int(len(found) * args.val_ratio))
         val_shards += [(name, p) for p in found[:split]]
         train_shards += [(name, p) for p in found[split:]]
         datasets.append(name)
-        print(f"  {name}: train {len(found)-split} / val {split} shards", flush=True)
+        print(f"  {name}: train {len(found)-split} / val {split} shards"
+              f"{'' if shard_backend is None else f' [{shard_backend}]'}", flush=True)
     print(f"train {len(train_shards)} / val {len(val_shards)} shards "
           f"over {len(datasets)} domain(s)", flush=True)
 
@@ -157,6 +192,8 @@ def main():
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     out_dir.mkdir(parents=True, exist_ok=True)
     json.dump({"datasets": datasets, "samples": dict(zip(datasets, counts)),
+               "backend": backend.name, "model": str(args.model),
+               "block_length": args.block_length,
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
                "val_ratio": args.val_ratio, "pairs": args.pairs,
@@ -177,14 +214,17 @@ def main():
         x = record["x_at_block_start"].unsqueeze(0).to(device)
         cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
         cache.layer_hidden_states = {}
-        model(x, int(record["block_start"]), 1, cache)
+        # position_offset is the cache *window*, not the block: on Dream the
+        # window starts one token earlier. Passing block_start here would cut
+        # the cache around a different set of columns than the teacher did.
+        model(x, window_start(record), 1, cache)
         return cache.layer_hidden_states
 
     def step(record, train: bool):
         hidden = features(record)
         cand = record["candidate_indices"].to(device)
-        bs = int(record["block_start"])
-        blk = torch.arange(bs, bs + int(record["block_length"]), device=device)
+        ws = window_start(record)
+        blk = torch.arange(ws, ws + window_length(record), device=device)
         label = record["label_final_rowmax"].float().to(device)
         total, recalls = 0.0, []
         for l in range(L):

@@ -23,7 +23,11 @@ def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default=str(REPO_ROOT / "model" / "LLaDA-8B-Instruct"))
+    p.add_argument("--model", required=True,
+                   help="the checkpoint the teacher labels came from; required so "
+                        "a recall number always says which model produced it")
+    p.add_argument("--block-length", type=int, default=32,
+                   help="must match the teacher run")
     p.add_argument("--student",
                    default=str(REPO_ROOT / "artifacts/ckpts/1ds_300_e6_lr2e-4_6a5fc6/checkpoint-best"))
     p.add_argument("--root", default=str(REPO_ROOT / "artifacts"))
@@ -34,18 +38,16 @@ def main():
     torch.set_grad_enabled(False)
     random.seed(0)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from transformers import AutoConfig
-    from future_dllm import LLaDAModelLM, CustomCache
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from future_dllm import CustomCache, load_model
     from future_dllm import load_prompt_utility_student
+    from train_student import window_length, window_start
 
-    cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    cfg.block_len, cfg.keep_ratio = 32, 1.0
-    model = LLaDAModelLM.from_pretrained(args.model, config=cfg, device_map="auto",
-                                         torch_dtype=torch.bfloat16,
-                                         trust_remote_code=True).eval()
+    model, backend = load_model(args.model, max_seq_len=4096,
+                                block_length=args.block_length, keep_ratio=1.0)
     CustomCache.capture_layer_hidden_states = (
         lambda self, layer_id, hidden: self.layer_hidden_states.__setitem__(layer_id, hidden))
-    device, L = model.device, model.config.n_layers
+    device, L = model.device, backend.n_layers
 
     student = load_prompt_utility_student(args.student, device).float().eval()
 
@@ -53,7 +55,7 @@ def main():
         x = record["x_at_block_start"].unsqueeze(0).to(device)
         cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
         cache.layer_hidden_states = {}
-        model(x, int(record["block_start"]), 1, cache)
+        model(x, window_start(record), 1, cache)
         return cache.layer_hidden_states
 
     print(f"{'dataset':10s} {'blocks':>7s} {'scorer':>8s} {'random':>8s} {'recency':>8s}")
@@ -67,8 +69,8 @@ def main():
             for record in torch.load(path, map_location="cpu", weights_only=False)["blocks"]:
                 hidden = features(record)
                 cand = record["candidate_indices"].to(device)
-                bs = int(record["block_start"])
-                blk = torch.arange(bs, bs + int(record["block_length"]), device=device)
+                ws = window_start(record)
+                blk = torch.arange(ws, ws + window_length(record), device=device)
                 label = record["label_final_rowmax"].float().to(device)
                 C = label.size(-1)
                 for l in range(L):
