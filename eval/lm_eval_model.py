@@ -1,4 +1,4 @@
-"""lm-eval model for future_dllm, registered as ``LLaDA_future``.
+"""lm-eval model for future_dllm, registered as ``LLaDA_future`` and ``Dream_future``.
 
 Self-contained: it subclasses lm-eval's own ``HFLM`` for tokenisation and
 plumbing, and replaces generation with future_dllm's block-wise ``generate()``,
@@ -8,9 +8,17 @@ so the cache knobs are reachable from ``--model_args``:
 
 ``keep_ratio`` below 1.0 needs a trained scorer; 1.0 disables eviction.
 
-Multiple-choice tasks use LLaDA's diffusion Monte Carlo likelihood estimator.
-With eviction enabled, each candidate continuation is scored block by block
-through the same student-selected sparse cache used during generation.
+Both registered names run the same class; the family comes from the
+checkpoint's config, so the name only has to exist for lm-eval's registry.
+
+Multiple-choice tasks use the diffusion Monte Carlo likelihood estimator. With
+eviction enabled, each candidate continuation is scored block by block through
+the same student-selected sparse cache used during generation.
+
+Dream's autoregressive logit shift applies to both likelihood paths as well as
+generation. It matters most here: at keep_ratio=1.0 only
+``_full_sequence_logits`` runs, and a missing shift there does not raise -- it
+just drags multiple-choice accuracy down toward chance.
 """
 
 from __future__ import annotations
@@ -54,8 +62,8 @@ def _generation_kwargs(raw: dict, default_max_gen_toks: int) -> dict:
     return out
 
 
-@register_model("LLaDA_future")
-class LLaDAFuture(HFLM):
+@register_model("LLaDA_future", "Dream_future")
+class FutureDLLM(HFLM):
     def __init__(
         self,
         pretrained: str = str(DEFAULT_MODEL),
@@ -71,11 +79,8 @@ class LLaDAFuture(HFLM):
         log_type: str = "ftb",
         **kwargs,
     ):
-        from transformers import AutoConfig
-        from future_dllm import LLaDAModelLM, generate, load_prompt_utility_student
-        from future_dllm.llada_generate import MASK_ID
+        from future_dllm import load_model, load_prompt_utility_student
 
-        self._generate = generate
         self._block_len = int(block_len)
         self._max_seq_len = int(max_seq_len)
         self._max_prompt_len = int(max_prompt_len) or self._max_seq_len
@@ -84,7 +89,6 @@ class LLaDAFuture(HFLM):
         self._sampling_eps = float(sampling_eps)
         self._nll_type = str(nll_type)
         self._log_type = str(log_type)
-        self._fallback_mask_id = MASK_ID
 
         if not 0.0 < self._keep_ratio <= 1.0:
             raise ValueError("keep_ratio must be in (0, 1]")
@@ -98,23 +102,22 @@ class LLaDAFuture(HFLM):
             raise ValueError("sampling_eps must be in (0, 1]")
         if self._nll_type != "mc" or self._log_type != "ftb":
             raise ValueError(
-                "this wrapper supports the official LLaDA likelihood settings "
+                "this wrapper supports the official diffusion likelihood settings "
                 "nll_type=mc,log_type=ftb"
             )
 
-        config = AutoConfig.from_pretrained(str(pretrained), trust_remote_code=True)
-        native_limit = int(getattr(config, "max_sequence_length", self._max_seq_len))
-        if self._max_seq_len > native_limit:
+        if str(dtype) not in ("bfloat16", ""):
+            raise ValueError("future_dllm backends load in bfloat16")
+        model, backend = load_model(
+            str(pretrained), max_seq_len=self._max_seq_len,
+            block_length=self._block_len, keep_ratio=self._keep_ratio)
+        self._backend = backend
+        self._generate = backend.generate
+        self._n_layers = backend.n_layers
+        self._fallback_mask_id = backend.mask_id
+        if self._max_seq_len > backend.native_max_seq_len:
             print(f"warning: max_seq_len={self._max_seq_len} exceeds the checkpoint's "
-                  f"trained context {native_limit}", flush=True)
-        config.max_sequence_length = self._max_seq_len
-        config.block_len = int(block_len)
-        config.keep_ratio = float(keep_ratio)
-        torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
-                       "float32": torch.float32}.get(str(dtype), torch.bfloat16)
-        model = LLaDAModelLM.from_pretrained(
-            str(pretrained), config=config, device_map="auto",
-            torch_dtype=torch_dtype, trust_remote_code=True).eval()
+                  f"trained context {backend.native_max_seq_len}", flush=True)
 
         # HFLM skips its own loading when handed a live model, but still needs
         # the path to find the tokenizer.
@@ -139,10 +142,28 @@ class LLaDAFuture(HFLM):
             raise ValueError(
                 "eviction needs a trained scorer: pass student_path=<checkpoint>, "
                 "or keep_ratio=1.0 to run without eviction")
-        print(f"[LLaDA_future] keep_ratio={keep_ratio} block_len={block_len} "
+        # _forward_process writes this id into the noised batch, so a wrong one
+        # corrupts every likelihood score without raising anywhere.
+        tokenizer_mask = getattr(self.tokenizer, "mask_token_id", None)
+        if tokenizer_mask is not None and int(tokenizer_mask) != backend.mask_id:
+            raise RuntimeError(
+                f"tokenizer mask_token_id {int(tokenizer_mask)} disagrees with the "
+                f"{backend.name} config's {backend.mask_id}")
+        print(f"[{backend.name}_future] keep_ratio={keep_ratio} block_len={block_len} "
               f"max_seq_len={self._max_seq_len} "
               f"max_prompt_len={self._max_prompt_len} "
+              f"logit_shift={backend.logit_shift} "
               f"scorer={student_path or 'none (no eviction)'}", flush=True)
+
+    def _shift(self, logits: torch.Tensor) -> torch.Tensor:
+        """Move each row's prediction onto the position it describes.
+
+        Dream was adapted from an autoregressive Qwen2, so row r predicts token
+        r+1. LLaDA predicts in place and this is the identity.
+        """
+        if not self._backend.logit_shift:
+            return logits
+        return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
     @property
     def _mask_id(self) -> int:
@@ -200,12 +221,13 @@ class LLaDAFuture(HFLM):
         from future_dllm import CustomCache
 
         cache = CustomCache(
-            n_layers=self.model.config.n_layers,
+            n_layers=self._n_layers,
             device=batch.device,
             keep_ratio=1.0,
         )
-        # LLaDA denoises token i from logits[i], as in its generation loop.
-        return self.model(batch, 0, 0, cache).logits
+        # Token i is denoised from row i, as in the generation loop -- after the
+        # backend's shift has put each row on the position it describes.
+        return self._shift(self.model(batch, 0, 0, cache).logits)
 
     @torch.no_grad()
     def _sparse_target_logits(
@@ -246,17 +268,26 @@ class LLaDAFuture(HFLM):
             model_input[:, block_end:] = self._mask_id
 
             cache = CustomCache(
-                n_layers=self.model.config.n_layers,
+                n_layers=self._n_layers,
                 device=model_input.device,
                 keep_ratio=self._keep_ratio,
                 cache_scorer=self._scorer,
                 prompt_length=prefix_length,
                 generation_length=generation_length,
             )
-            self.model(model_input, block_start, 1, cache)
-            logits = self.model(
+            full = self._shift(self.model(model_input, block_start, 1, cache).logits)
+            logits = self._shift(self.model(
                 model_input[:, block_start:block_end], block_start, 2, cache
-            ).logits
+            ).logits)
+            if self._backend.logit_shift:
+                # Under the shift a block cannot supply its own first row: that
+                # token is described by the row before the block, which the
+                # block-only forward does not hold. Generation solves this by
+                # confirming block_start on the step-0 full forward; the same
+                # full forward is right here, and it is the one just run to
+                # build the cache.
+                logits = torch.cat([full[:, block_start:block_start + 1],
+                                    logits[:, 1:]], dim=1)
             valid_length = min(self._block_len, target_length - local_start)
             block_logits.append(logits[:, :valid_length])
 
@@ -311,7 +342,7 @@ class LLaDAFuture(HFLM):
         iterator = tqdm(
             requests,
             disable=self.rank != 0,
-            desc="LLaDA diffusion loglikelihood",
+            desc=f"{self._backend.name} diffusion loglikelihood",
         )
         for request in iterator:
             prefix, target = self._encode_pair(*request.args)
@@ -321,7 +352,7 @@ class LLaDAFuture(HFLM):
 
     def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
         raise NotImplementedError(
-            "rolling likelihood is not defined for the LLaDA diffusion evaluator"
+            "rolling likelihood is not defined for the diffusion evaluator"
         )
 
     def _call_generate(self, context_enc, gen_kwargs, gen_length):
@@ -355,7 +386,8 @@ class LLaDAFuture(HFLM):
                         done[rec["key"]] = rec["text"]
             os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
             store = open(store_path, "a")
-            print(f"[LLaDA_future] resume store: {len(done)} answers on disk", flush=True)
+            print(f"[{self._backend.name}_future] resume store: "
+                  f"{len(done)} answers on disk", flush=True)
 
         results = []
         bar = tqdm(total=len(requests), disable=(disable_tqdm or self.rank != 0),

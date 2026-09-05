@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Run one lm-eval task with the LLaDA future-cache model.
+# Run one lm-eval task with the future-cache model, on LLaDA or Dream.
 #
 #   scripts/run_eval.sh <dataset> <keep_ratio> [checkpoint]
+#
+# The family is read from the checkpoint's config, so pointing FUTURE_DLLM_MODEL
+# at a Dream directory is all it takes. Results are written under a per-model
+# directory so the two families' numbers never land in the same tree.
 #
 # Examples:
 #   scripts/run_eval.sh samsum 0.1 artifacts/ckpts/<run>/checkpoint-best
 #   scripts/run_eval.sh gsm8k  1.0
 #   LIMIT=200 scripts/run_eval.sh math 0.1 artifacts/ckpts/<run>/checkpoint-best
+#   FUTURE_DLLM_MODEL=$PWD/model/Dream-v0-Instruct-7B scripts/run_eval.sh gsm8k 0.1 <ckpt>
 set -euo pipefail
 
 DATASET="${1:?usage: run_eval.sh <dataset> <keep_ratio> [checkpoint]}"
@@ -16,6 +21,13 @@ CKPT="${3:-}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
 MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/LLaDA-8B-Instruct}"
+# lm-eval needs a registered name; both map to the same class, which picks the
+# family from the checkpoint. Keeping the names distinct means a run's log says
+# which family it thought it was loading.
+case "$(basename "$MODEL")" in
+  *Dream*|*dream*) MODEL_NAME=Dream_future ;;
+  *)               MODEL_NAME=LLaDA_future ;;
+esac
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 LONGBENCH_DATA="${LONGBENCH_DATA:-$DATA_ROOT/longbench/data}"
 
@@ -46,7 +58,6 @@ if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ]; then
   exit 2
 fi
 
-MODEL_NAME=LLaDA_future
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_seq_len=$MAX_SEQ_LEN"
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
