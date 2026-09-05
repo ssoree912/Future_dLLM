@@ -9,11 +9,17 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
+# Dream runs at 2048 total, not 4096. The checkpoint's config advertises
+# max_position_embeddings=131072, but that is inherited from the Qwen2.5-7B
+# weights Dream was initialised from, not a trained diffusion context.
+# Sparse-dLLM evaluates Dream at max_seq_len=2048 (4096 only for humaneval and
+# longbench), so 2048 is what the baseline comparison is against.
+# Generation lengths stay per-dataset, so the prompt cap is 2048 - gen_length.
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
-PROMPT_ROOT="${PROMPT_ROOT:-$REPO/artifacts/prompt_shards_dream}"
-TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream}"
-MAX_SEQ_LEN=4096
+PROMPT_ROOT="${PROMPT_ROOT:-$REPO/artifacts/prompt_shards_dream_${MAX_SEQ_LEN}}"
+TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream_${MAX_SEQ_LEN}}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_FILE:-$REPO/logs/teacher_extract/extract_default_teacher_dream_${RUN_TAG}.log}"
 
