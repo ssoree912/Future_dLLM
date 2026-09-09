@@ -12,11 +12,15 @@
 # next task starts. Completed (dataset, keep) pairs are skipped on a rerun, so
 # an interrupted sweep resumes where it stopped.
 #
-# Multiple-choice tasks (mmlu / arc_c / piqa / gpqa) are deliberately excluded.
-# They score by diffusion loglikelihood and currently return near-chance numbers
-# through lm-eval (piqa 0.45 at keep_ratio=1.0, where scoring the same items
-# directly gives 0.825). Until that is understood they would only produce
-# invalid rows.
+# KEEPS and DATASETS are overridable, so a second pass can add a ratio or a few
+# tasks without re-running what is already on disk -- completed pairs are
+# skipped either way.
+#
+#   KEEPS="0.5" scripts/run_eval_sweep_dream.sh <ckpt>          # fill the 0.5 row
+#   DATASETS="arc_c piqa gpqa" KEEPS="0.1 0.5 1.0" ...          # add the MC tasks
+#
+# MMLU stays out: 14,042 items x 4 candidates x 32 diffusion steps is far more
+# than the other three cost together.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +42,7 @@ exec > >(tee -a "$SWEEP_LOG") 2>&1
 
 # keep_ratio=1.0 is the no-eviction reference every 0.1 row is read against, so
 # each dataset runs both back to back rather than doing all of one ratio first.
-DATASETS=(
+DEFAULT_DATASETS=(
   gsm8k                                    # 5-shot reasoning, gen 256
   gov_report multi_news musique            # LongBench, the scorer's own domains
   math500 humaneval                        # short generative benchmarks
@@ -48,7 +52,8 @@ DATASETS=(
   passage_retrieval_en passage_count qmsum
   math                                     # 5,000 items -- longest, so last
 )
-KEEPS=(0.1 1.0)
+read -r -a DATASETS <<< "${DATASETS:-${DEFAULT_DATASETS[*]}}"
+read -r -a KEEPS <<< "${KEEPS:-0.1 1.0}"
 
 total=$(( ${#DATASETS[@]} * ${#KEEPS[@]} ))
 printf 'dream eval sweep\nmodel=%s\nckpt=%s\nmax_seq_len=%s\ngpu=%s\nruns=%d\nlog=%s\n\n' \
