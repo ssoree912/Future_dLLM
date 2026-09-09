@@ -20,6 +20,12 @@ generation_kwargs:
     - "\n#"
     - "\nif"
     - "\nprint"
+    # Instruct models close the block with a markdown fence. build_predictions
+    # appends the raw continuation to the prompt and executes it, so a stray
+    # ``` is a SyntaxError and the item scores 0 no matter how good the code is.
+    # Measured on Dream-v0-Instruct-7B: 9/15 completions carried a fence, and
+    # only 6/15 compiled; cutting at the fence takes that to 15/15.
+    - "```"
   max_gen_toks: 512
   do_sample: false
 repeats: 1

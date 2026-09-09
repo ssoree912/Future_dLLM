@@ -43,7 +43,14 @@ def pass_at_k(
 
 
 def build_predictions(resps: list[list[str]], docs: list[dict]) -> list[list[str]]:
+    """Prompt + continuation, cut at a markdown fence if one survived.
+
+    ``until`` already stops generation at the fence; this is the second line of
+    defence, and it matches what lm-eval's own ``build_predictions_instruct``
+    does. Without it an instruct model's closing ``` lands inside the executed
+    source and the item fails on syntax rather than on correctness.
+    """
     return [
-        [doc["prompt"] + response for response in responses]
+        [doc["prompt"] + response.split("```")[0] for response in responses]
         for responses, doc in zip(resps, docs, strict=True)
     ]
