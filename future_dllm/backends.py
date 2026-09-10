@@ -71,7 +71,8 @@ def detect_family(model_path: str | Path) -> str:
 
 
 def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
-               keep_ratio: float = 1.0, device_map: str = "auto") -> tuple[torch.nn.Module, Backend]:
+               keep_ratio: float = 1.0, selection: str = "student",
+               device_map: str = "auto") -> tuple[torch.nn.Module, Backend]:
     """Load a checkpoint with the eviction cache wired in, and describe it.
 
     ``block_len`` and ``keep_ratio`` are injected onto the config because that is
@@ -92,6 +93,7 @@ def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
         # The window is the block exactly, same as Sparse-dLLM: the queried rows
         # and the columns filter_cache removes are the same set.
         cfg.block_len, cfg.keep_ratio = block_length, keep_ratio
+        cfg.selection = selection
         cfg.use_cache = False
         model = DreamModel.from_pretrained(
             model_path, config=cfg, device_map=device_map,
@@ -117,6 +119,7 @@ def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
     native = int(getattr(cfg, "max_sequence_length", max_seq_len))
     cfg.max_sequence_length = max_seq_len
     cfg.block_len, cfg.keep_ratio = block_length, keep_ratio
+    cfg.selection = selection
     model = LLaDAModelLM.from_pretrained(
         model_path, config=cfg, device_map=device_map,
         torch_dtype=torch.bfloat16, trust_remote_code=True).eval()

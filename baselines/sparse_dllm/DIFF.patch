@@ -1,0 +1,15 @@
+--- /workspace/dllm/Sparse-dLLM/opencompass/models/sparse_dllm/dream/modeling_dream.py	2026-09-04 02:39:23.600042680 +0000
++++ baselines/sparse_dllm/dream/modeling_dream.py	2026-09-10 02:42:55.539281342 +0000
+@@ -418,6 +418,12 @@
+             cached = customcache.get_cache(self.layer_idx)
+             key_states = torch.cat([cached["k"], key_states], dim = -2)
+             value_states = torch.cat([cached["v"], value_states], dim = -2)
++            # ADDED (future_dllm): teacher extraction reads what a finished
++            # block attends to, and post-RoPE q/k only exist here. A no-op for
++            # their own cache, which has no record_attention. This is the only
++            # departure from upstream in this directory - see DIFF.md.
++            if hasattr(customcache, "record_attention"):
++                customcache.record_attention(self.layer_idx, query_states, key_states)
+ 
+         # print(query_states.shape, key_states.shape, value_states.shape)
+ 

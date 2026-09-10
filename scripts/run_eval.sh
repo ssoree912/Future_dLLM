@@ -28,6 +28,14 @@ case "$(basename "$MODEL")" in
   *Dream*|*dream*) MODEL_NAME=Dream_future ;;
   *)               MODEL_NAME=LLaDA_future ;;
 esac
+# SELECTION=sparse_dllm_orig routes to Sparse-dLLM's own vendored code instead
+# of our cache. Generative tasks only - their model has no likelihood path.
+# Both rows of the Dream comparison run through Sparse-dLLM's own code:
+#   SELECTION=sparse_dllm_orig            their attention score  (baseline)
+#   SELECTION=sparse_dllm_ours + <ckpt>   the trained scorer     (ours)
+case "${SELECTION:-student}" in
+  sparse_dllm_orig|sparse_dllm_ours) MODEL_NAME=Sparse_dLLM_Dream ;;
+esac
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 LONGBENCH_DATA="${LONGBENCH_DATA:-$DATA_ROOT/longbench/data}"
 
@@ -53,13 +61,23 @@ case "$DATASET" in
   *) echo "unknown dataset: $DATASET" >&2; exit 1 ;;
 esac
 
-if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ]; then
-  echo "keep_ratio=$KEEP requires a student checkpoint" >&2
+# SELECTION=sparse_dllm runs the paper baseline's attention ranking over the
+# same cache, candidates and budget -- no trained scorer, so no checkpoint.
+SELECTION="${SELECTION:-student}"
+if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ] \
+   && [ "$SELECTION" != "sparse_dllm" ] && [ "$SELECTION" != "sparse_dllm_orig" ]; then
+  echo "keep_ratio=$KEEP requires a student checkpoint (or SELECTION=sparse_dllm)" >&2
   exit 2
 fi
 
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_seq_len=$MAX_SEQ_LEN"
+if [ "$SELECTION" = "sparse_dllm" ]; then
+  ARGS="$ARGS,selection=$SELECTION"
+elif [ "$SELECTION" = "sparse_dllm_orig" ] || [ "$SELECTION" = "sparse_dllm_ours" ]; then
+  ARGS="$ARGS,kernel_size=${KERNEL_SIZE:-3},alg=${ALG:-entropy}"
+  ARGS="$ARGS,temperature=${TEMPERATURE:-0.2},top_p=${TOP_P:-0.95}"
+fi
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
   ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"
 fi
@@ -70,6 +88,8 @@ METHOD=none
 if [ -n "$CKPT" ]; then
   ARGS="$ARGS,student_path=$(cd "$(dirname "$CKPT")" && pwd)/$(basename "$CKPT")"
   METHOD=$(basename "$(dirname "$CKPT")")
+elif [ "$SELECTION" != "student" ]; then
+  METHOD="$SELECTION"
 fi
 MODEL_TAG="${FUTURE_DLLM_MODEL_TAG:-$(basename "$MODEL")}"
 

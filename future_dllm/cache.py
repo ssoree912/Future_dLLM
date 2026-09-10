@@ -93,6 +93,7 @@ class CustomCache:
         device: torch.device,
         keep_ratio: float = 1.0,
         cache_scorer=None,
+        selection: str = "student",
         prompt_length: int = 0,
         generation_length: int = 0,
         capture_current_scores: bool = False,
@@ -101,6 +102,13 @@ class CustomCache:
         self.cache = {}
         self.keep_ratios = [keep_ratio for _ in range(n_layers)]
         self.cache_scorer = cache_scorer
+        # "student" ranks candidates with the trained scorer; "sparse_dllm"
+        # ranks them with the paper baseline's attention score. Everything else
+        # -- candidate set, budget, block schedule, delayed selection -- is the
+        # same either way, so a run of each isolates the ranking rule.
+        if selection not in ("student", "sparse_dllm"):
+            raise ValueError(f"unknown selection {selection!r}")
+        self.selection = selection
         self.prompt_length = prompt_length
         self.generation_length = generation_length
 
@@ -179,10 +187,24 @@ class CustomCache:
             self.cache[layer_id] = {"k": keep_k, "v": keep_v}
             return
 
+        if self.selection == "sparse_dllm":
+            # Sparse-dLLM's rule, over the same candidates and the same budget.
+            # It needs no hidden states, so nothing was captured for it.
+            scores = sparse_dllm_current_score(
+                q_block, keep_k, self.current_score_pool_kernel)
+            keep_num = int(scores.size(-1) * self.keep_ratios[layer_id])
+            keep_indices = torch.topk(
+                scores, k=keep_num, dim=-1).indices.squeeze(0).sort().values
+            head_index = torch.arange(keep_k.size(1), device=keep_k.device)[:, None]
+            self.cache[layer_id] = {"k": keep_k[:, head_index, keep_indices],
+                                    "v": keep_v[:, head_index, keep_indices]}
+            return
+
         if self.cache_scorer is None:
             raise RuntimeError(
                 "future_dllm evicts with a trained scorer; pass a student "
-                "checkpoint, or run with keep_ratio=1.0 to disable eviction"
+                "checkpoint, selection=sparse_dllm for the baseline, or "
+                "keep_ratio=1.0 to disable eviction"
             )
 
         hidden_states = self.layer_hidden_states.pop(layer_id, None)

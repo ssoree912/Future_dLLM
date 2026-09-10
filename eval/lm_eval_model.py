@@ -72,6 +72,7 @@ class FutureDLLM(HFLM):
         max_seq_len: int = 4096,
         max_prompt_len: int = 0,
         student_path: str = "",
+        selection: str = "student",
         dtype: str = "bfloat16",
         diffusion_steps: int = 32,
         sampling_eps: float = 1e-3,
@@ -108,9 +109,11 @@ class FutureDLLM(HFLM):
 
         if str(dtype) not in ("bfloat16", ""):
             raise ValueError("future_dllm backends load in bfloat16")
+        self._selection = str(selection)
         model, backend = load_model(
             str(pretrained), max_seq_len=self._max_seq_len,
-            block_length=self._block_len, keep_ratio=self._keep_ratio)
+            block_length=self._block_len, keep_ratio=self._keep_ratio,
+            selection=self._selection)
         self._backend = backend
         self._generate = backend.generate
         self._n_layers = backend.n_layers
@@ -138,10 +141,11 @@ class FutureDLLM(HFLM):
         self._scorer = None
         if student_path:
             self._scorer = load_prompt_utility_student(student_path, device)
-        elif float(keep_ratio) < 1.0:
+        elif float(keep_ratio) < 1.0 and self._selection != "sparse_dllm":
             raise ValueError(
                 "eviction needs a trained scorer: pass student_path=<checkpoint>, "
-                "or keep_ratio=1.0 to run without eviction")
+                "selection=sparse_dllm for the paper baseline, or keep_ratio=1.0 "
+                "to run without eviction")
         # _forward_process writes this id into the noised batch, so a wrong one
         # corrupts every likelihood score without raising anywhere.
         tokenizer_mask = getattr(self.tokenizer, "mask_token_id", None)
@@ -149,7 +153,8 @@ class FutureDLLM(HFLM):
             raise RuntimeError(
                 f"tokenizer mask_token_id {int(tokenizer_mask)} disagrees with the "
                 f"{backend.name} config's {backend.mask_id}")
-        print(f"[{backend.name}_future] keep_ratio={keep_ratio} block_len={block_len} "
+        print(f"[{backend.name}_future] selection={self._selection} "
+              f"keep_ratio={keep_ratio} block_len={block_len} "
               f"max_seq_len={self._max_seq_len} "
               f"max_prompt_len={self._max_prompt_len} "
               f"logit_shift={backend.logit_shift} "
@@ -271,6 +276,7 @@ class FutureDLLM(HFLM):
                 n_layers=self._n_layers,
                 device=model_input.device,
                 keep_ratio=self._keep_ratio,
+                selection=self._selection,
                 cache_scorer=self._scorer,
                 prompt_length=prefix_length,
                 generation_length=generation_length,

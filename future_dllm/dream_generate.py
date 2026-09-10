@@ -39,10 +39,62 @@ def shift_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
 
+# ---------------------------------------------------------------------------
+# Sparse-dLLM's reveal rule, copied from their generation_utils.sample_tokens
+# so a run of ours can be decoded exactly the way their Dream runs are. Our own
+# rule ("low_confidence": rank by the chosen token's probability, greedy pick)
+# stays the default; this is reached only when alg is given.
+#
+# The two rank different things. low_confidence asks how sure the top token is;
+# entropy asks how peaked the whole distribution is, which orders the reveals
+# differently and therefore changes every step after the first.
+# ---------------------------------------------------------------------------
+
+
+def _top_p_logits(logits, top_p):
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    remove = cumulative_probs > top_p
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., 0] = 0
+    mask = torch.zeros_like(logits, dtype=torch.bool, device=logits.device)
+    mask = mask.scatter_(-1, sorted_indices, remove)
+    return logits.masked_fill(mask, torch.finfo(logits.dtype).min)
+
+
+def sample_tokens(logits, temperature=0.0, top_p=None, alg="entropy"):
+    """(confidence, token) with Sparse-dLLM's semantics."""
+    import torch.distributions as dists
+
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = _top_p_logits(logits, top_p)
+    probs = torch.softmax(logits, dim=-1)
+
+    if temperature > 0:
+        x0 = dists.Categorical(probs=probs).sample()
+        confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
+    else:
+        confidence, x0 = probs.max(dim=-1)
+
+    if alg == "maskgit_plus":
+        pass                                   # confidence is the chosen prob
+    elif alg == "topk_margin":
+        top2 = torch.topk(probs, 2, dim=-1).values
+        confidence = top2[..., 0] - top2[..., 1]
+    elif alg == "entropy":
+        log_probs = torch.log(probs + 1e-10)
+        confidence = torch.sum(probs * log_probs, dim=-1)
+    else:
+        raise NotImplementedError(f"unknown alg {alg!r}")
+    return confidence, x0
+
+
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=32,
              temperature=0., cfg_scale=0., remasking='low_confidence',
-             mask_id=MASK_ID, cache_scorer=None):
+             mask_id=MASK_ID, cache_scorer=None, alg=None, top_p=None):
     """Generate ``gen_length`` tokens block by block.
 
     ``cache_scorer`` is a trained ``PromptUtilityStudent``; without one the model
@@ -73,6 +125,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
         cache = CustomCache(
             n_layers=model.config.num_hidden_layers, device=model.device,
             keep_ratio=model.config.keep_ratio,
+            selection=getattr(model.config, "selection", "student"),
             cache_scorer=cache_scorer, prompt_length=prompt_len,
             generation_length=gen_length)
 
@@ -88,15 +141,19 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
 
             logits = model(model_input, block_start, cache_state, cache).logits
             logits = shift_logits(logits)
-            x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)
-
-            if remasking == 'low_confidence':
-                p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(torch.gather(p, -1, torch.unsqueeze(x0, -1)), -1)
-            elif remasking == 'random':
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            if alg is not None:
+                # Sparse-dLLM's rule, so a run can be decoded the way their
+                # Dream runs are. Note it samples when temperature > 0.
+                x0_p, x0 = sample_tokens(logits, temperature, top_p, alg)
             else:
-                raise NotImplementedError(remasking)
+                x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)
+                if remasking == 'low_confidence':
+                    p = F.softmax(logits, dim=-1)
+                    x0_p = torch.squeeze(torch.gather(p, -1, torch.unsqueeze(x0, -1)), -1)
+                elif remasking == 'random':
+                    x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                else:
+                    raise NotImplementedError(remasking)
 
             target = x if cache_state != 2 else x[:, block_start:block_end]
             if cache_state != 2:

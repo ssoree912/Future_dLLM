@@ -54,6 +54,11 @@ def parse_args():
     p.add_argument("--block-length", type=int, default=32,
                    help="must match the teacher run; only used to size the "
                         "replay forward's cache window")
+    p.add_argument("--decode", choices=("ours", "sparse"), default="ours",
+                   help="which code produced the labels. 'sparse' replays the "
+                        "selection-time forward through Sparse-dLLM's own Dream "
+                        "model, which is where those labels came from and where "
+                        "the scorer will be deployed")
     p.add_argument("--max-seq-len", type=int, default=4096,
                    help="reject teacher records longer than this total sequence length")
     p.add_argument("--lambda-list", type=float, default=1.0,
@@ -123,22 +128,37 @@ def main():
         raise SystemExit("--max-seq-len must be positive")
     torch.manual_seed(args.seed); random.seed(args.seed)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from future_dllm import CustomCache, load_model
 
-    model, backend = load_model(args.model, max_seq_len=args.max_seq_len,
-                                block_length=args.block_length, keep_ratio=1.0)
-    if args.max_seq_len > backend.native_max_seq_len:
-        print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
-              f"trained context {backend.native_max_seq_len}", flush=True)
+    if args.decode == "sparse":
+        # Labels came from their decode, so the states the scorer is trained on
+        # have to come from their forward too. Their cache is reached through
+        # StudentScorerCache with collect_pool, which captures hidden states
+        # without evicting anything.
+        from future_dllm.sparse_dllm_student import StudentScorerCache, load_model as load_sparse
+        model = load_sparse(args.model, block_length=args.block_length, keep_ratio=1.0)
+        backend_name = "sparse_dllm_dream"
+        L = int(model.config.num_hidden_layers)
+        H = int(model.config.hidden_size)
+    else:
+        from future_dllm import CustomCache, load_model
+        model, backend = load_model(args.model, max_seq_len=args.max_seq_len,
+                                    block_length=args.block_length, keep_ratio=1.0)
+        if args.max_seq_len > backend.native_max_seq_len:
+            print(f"warning: max_seq_len={args.max_seq_len} exceeds the checkpoint's "
+                  f"trained context {backend.native_max_seq_len}", flush=True)
+        backend_name, L, H = backend.name, backend.n_layers, backend.hidden_dim
     for p in model.parameters():
         p.requires_grad_(False)
-    device, L, H = model.device, backend.n_layers, backend.hidden_dim
-    print(f"backend={backend.name} layers={L} hidden={H}", flush=True)
+    device = model.device
+    print(f"backend={backend_name} decode={args.decode} layers={L} hidden={H}",
+          flush=True)
 
     # Capture has to stay on so training sees the same hidden states deployment
-    # will hand the scorer.
-    CustomCache.capture_layer_hidden_states = (
-        lambda self, layer_id, hidden: self.layer_hidden_states.__setitem__(layer_id, hidden))
+    # will hand the scorer. StudentScorerCache already captures under
+    # collect_pool, so this only applies to our own cache.
+    if args.decode == "ours":
+        CustomCache.capture_layer_hidden_states = (
+            lambda self, layer_id, hidden: self.layer_hidden_states.__setitem__(layer_id, hidden))
 
     # Split val per domain: mmlu carries 2 blocks per sample against 4 elsewhere,
     # so a sample-balanced val would let the block-heavy domains own the choice.
@@ -163,11 +183,11 @@ def main():
         # learns to rank the wrong candidates.
         head = load_shard(found[0])
         shard_backend = head.get("backend")
-        if shard_backend is not None and shard_backend != backend.name:
+        if shard_backend is not None and shard_backend != backend_name:
             raise SystemExit(
                 f"{name}: teacher labels were extracted with {shard_backend} "
                 f"({head.get('model', 'unknown checkpoint')}), but --model is a "
-                f"{backend.name} checkpoint. Pass the model the labels came from."
+                f"{backend_name} run. Pass the model and --decode the labels came from."
             )
         split = max(1, int(len(found) * args.val_ratio))
         val_shards += [(name, p) for p in found[:split]]
@@ -192,7 +212,8 @@ def main():
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     out_dir.mkdir(parents=True, exist_ok=True)
     json.dump({"datasets": datasets, "samples": dict(zip(datasets, counts)),
-               "backend": backend.name, "model": str(args.model),
+               "backend": backend_name, "decode": args.decode,
+               "model": str(args.model),
                "block_length": args.block_length,
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
@@ -212,12 +233,16 @@ def main():
                 f"--max-seq-len {args.max_seq_len}; use a matching student limit"
             )
         x = record["x_at_block_start"].unsqueeze(0).to(device)
-        cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
-        cache.layer_hidden_states = {}
-        # position_offset is the cache *window*, not the block: on Dream the
-        # window starts one token earlier. Passing block_start here would cut
-        # the cache around a different set of columns than the teacher did.
-        model(x, window_start(record), 1, cache)
+        if args.decode == "sparse":
+            cache = StudentScorerCache(n_layers=L, device=device, keep_ratio=1.0)
+            cache.collect_pool = True          # capture states, evict nothing
+            model(position_offset=window_start(record), cache_state=1,
+                  customcache=cache, input_ids=x)
+        else:
+            cache = CustomCache(n_layers=L, device=device, keep_ratio=1.0)
+            cache.layer_hidden_states = {}
+            # position_offset is the cache *window*, not the block.
+            model(x, window_start(record), 1, cache)
         return cache.layer_hidden_states
 
     def step(record, train: bool):

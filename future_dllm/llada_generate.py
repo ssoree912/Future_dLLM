@@ -60,6 +60,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
         cache = CustomCache(
             n_layers=model.config.n_layers, device=model.device,
             keep_ratio=model.config.keep_ratio,
+            selection=getattr(model.config, "selection", "student"),
             cache_scorer=cache_scorer, prompt_length=prompt_len,
             generation_length=gen_length)
 
