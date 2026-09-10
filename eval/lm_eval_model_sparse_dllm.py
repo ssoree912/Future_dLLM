@@ -7,8 +7,9 @@ six-line addition documented in ``baselines/sparse_dllm/DIFF.md``. This file
 replaces OpenCompass with lm-eval so the numbers land in our tasks, truncation
 and result files.
 
-Both the baseline and our method run through here, at their published Dream
-settings (``alg="entropy"``, temperature 0.2, top_p 0.95). Running ours on our
+Both the baseline and our method run through here, at Dream's own recommended
+settings (``alg="entropy"``, temperature 0.2, top_p 0.95 -- HKUNLP/Dream's
+README), which Sparse-dLLM also uses. Running ours on our
 old greedy ``low_confidence`` loop instead was tried and abandoned: aligning
 the decode piece by piece never reached equality, because their reveal count is
 recomputed from the timestep schedule each step where ours is fixed per block.

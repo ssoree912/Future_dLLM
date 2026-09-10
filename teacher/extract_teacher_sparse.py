@@ -55,8 +55,10 @@ def parse_args():
     p.add_argument("--block-length", type=int, default=32)
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument("--max-prompt-len", type=int, default=None)
-    # Their published Dream settings. Sampling is stochastic, so --seed is what
-    # makes a rerun reproduce the same labels.
+    # Dream's own recommended generation settings, from HKUNLP/Dream's README
+    # (temperature 0.2, top_p 0.95); Sparse-dLLM follows them, so matching them
+    # keeps the baseline and us on identical decoding. Sampling is stochastic,
+    # so --seed is what makes a rerun reproduce the same labels.
     p.add_argument("--alg", default="entropy")
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--top-p", type=float, default=0.95)
