@@ -23,6 +23,7 @@ import argparse, glob, hashlib, json, random, sys, time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,8 @@ import torch.nn.functional as F
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    from future_dllm.dream_decoding import add_dream_arguments
+    add_dream_arguments(p)
     p.add_argument("--model", required=True,
                    help="the checkpoint the teacher labels were extracted with. "
                         "Required, and checked against the shards: the replay "
@@ -134,6 +137,16 @@ def main():
         p.requires_grad_(False)
     device, L, H = model.device, backend.n_layers, backend.hidden_dim
     print(f"backend={backend.name} layers={L} hidden={H}", flush=True)
+    decoding = None
+    if backend.name == "dream":
+        from future_dllm.dream_decoding import DreamDecoding, require_matching_decoding
+        decoding = DreamDecoding.from_args(args).metadata()
+
+    def read_teacher(path):
+        shard = load_shard(path)
+        if decoding is not None:
+            require_matching_decoding(shard.get("decoding"), decoding, path)
+        return shard
 
     # Capture has to stay on so training sees the same hidden states deployment
     # will hand the scorer.
@@ -161,7 +174,7 @@ def main():
         # nothing downstream would notice the mismatch: a LLaDA shard trained
         # against Dream just replays a different vocabulary's ids and quietly
         # learns to rank the wrong candidates.
-        head = load_shard(found[0])
+        head = read_teacher(found[0])
         shard_backend = head.get("backend")
         if shard_backend is not None and shard_backend != backend.name:
             raise SystemExit(
@@ -193,6 +206,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     json.dump({"datasets": datasets, "samples": dict(zip(datasets, counts)),
                "backend": backend.name, "model": str(args.model),
+               "decoding": decoding,
                "block_length": args.block_length,
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
@@ -260,7 +274,7 @@ def main():
         student.train(); random.shuffle(train_shards)
         started, losses = time.time(), []
         for n, (_, path) in enumerate(train_shards):
-            for record in load_shard(path)["blocks"]:
+            for record in read_teacher(path)["blocks"]:
                 losses.append(step(record, True)[0])
             if (n + 1) % 30 == 0:
                 print(f"  epoch {epoch} {n+1}/{len(train_shards)} "
@@ -269,7 +283,7 @@ def main():
         per_ds = {}
         with torch.no_grad():
             for name, p in val_shards:
-                for r in load_shard(p)["blocks"]:
+                for r in read_teacher(p)["blocks"]:
                     per_ds.setdefault(name, []).append(step(r, False)[1])
         means = {k: sum(v) / max(1, len(v)) for k, v in per_ds.items()}
         score = sum(means.values()) / max(1, len(means))   # domain macro average
@@ -281,6 +295,9 @@ def main():
             best = score
             ckpt = out_dir / "checkpoint-best"
             ckpt.mkdir(parents=True, exist_ok=True)
+            if decoding is not None:
+                with open(ckpt / "decoding.json", "w") as fh:
+                    json.dump(decoding, fh, indent=2)
             torch.save({k: v.cpu() for k, v in student.state_dict().items()},
                        ckpt / "pytorch_model.bin")
             json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,

@@ -25,9 +25,11 @@ MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/LLaDA-8B-Instruct}"
 # family from the checkpoint. Keeping the names distinct means a run's log says
 # which family it thought it was loading.
 case "$(basename "$MODEL")" in
-  *Dream*|*dream*) MODEL_NAME=Dream_future ;;
-  *)               MODEL_NAME=LLaDA_future ;;
+  *Dream*|*dream*) MODEL_NAME=Dream_future; DEFAULT_MAX_SEQ_LEN=2048
+                  source "$REPO/scripts/dream_decoding_env.sh" ;;
+  *)               MODEL_NAME=LLaDA_future; DEFAULT_MAX_SEQ_LEN=4096 ;;
 esac
+EVICTION_METHOD="${EVICTION_METHOD:-student}"
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 LONGBENCH_DATA="${LONGBENCH_DATA:-$DATA_ROOT/longbench/data}"
 
@@ -53,13 +55,16 @@ case "$DATASET" in
   *) echo "unknown dataset: $DATASET" >&2; exit 1 ;;
 esac
 
-if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ]; then
+if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ] && [ "$EVICTION_METHOD" != sparse ]; then
   echo "keep_ratio=$KEEP requires a student checkpoint" >&2
   exit 2
 fi
 
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-$DEFAULT_MAX_SEQ_LEN}"
 ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_seq_len=$MAX_SEQ_LEN"
+if [ "$MODEL_NAME" = Dream_future ]; then
+  ARGS="$ARGS,eviction_method=$EVICTION_METHOD,dream_alg=$DREAM_ALG,dream_temperature=$DREAM_TEMPERATURE,dream_top_p=$DREAM_TOP_P,dream_steps=$DREAM_STEPS,dream_seed=$DREAM_SEED"
+fi
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
   ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"
 fi
@@ -67,11 +72,15 @@ if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   ARGS="$ARGS,diffusion_steps=${NLL_SAMPLES:-32}"
 fi
 METHOD=none
+if [ "$EVICTION_METHOD" = sparse ]; then METHOD=sparse; fi
 if [ -n "$CKPT" ]; then
   ARGS="$ARGS,student_path=$(cd "$(dirname "$CKPT")" && pwd)/$(basename "$CKPT")"
   METHOD=$(basename "$(dirname "$CKPT")")
 fi
 MODEL_TAG="${FUTURE_DLLM_MODEL_TAG:-$(basename "$MODEL")}"
+if [ "$MODEL_NAME" = Dream_future ]; then
+  MODEL_TAG="${FUTURE_DLLM_MODEL_TAG:-$(basename "$MODEL")_${DREAM_DECODER_TAG}}"
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RESULT="$REPO/results/${MODEL_TAG}/keep${KEEP}/${DATASET}/${DATASET}_keep${KEEP}_${METHOD}_${STAMP}.json"

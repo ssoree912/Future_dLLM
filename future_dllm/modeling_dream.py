@@ -25,11 +25,8 @@ Vendored from Dream-org/Dream-v0-Instruct-7B and patched the same way
 prune it, and then decode against the pruned cache alone.
 
 Dream is GQA (28 query heads over 4 KV heads) where LLaDA is MHA. The cache
-therefore stores K/V *before* ``repeat_kv`` -- 4 heads, not 28 -- because
-that is the layout ``CustomCache`` indexes and scores over. ``repeat_kv``
-runs after the cached and current keys are concatenated, immediately before
-SDPA. Caching post-expansion would not raise anywhere; it would just score
-the wrong thing and hold 7x the memory.
+therefore stores K/V on 4 heads, not 28. SDPA expands them using
+``enable_gqa=True``, exactly as in Sparse-dLLM's Dream attention.
 """
 
 import math
@@ -437,20 +434,13 @@ class DreamSdpaAttention(DreamAttention):
             value_states = torch.cat([cached["v"], value_states], dim=-2)
             customcache.record_attention(self.layer_idx, query_states, key_states)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+        # Keep the reference GQA layout and SDPA dispatch for token-level parity.
         # causal_mask = attention_mask
         # if attention_mask is not None:  # no matter the length, we just slice it
         #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
@@ -463,6 +453,7 @@ class DreamSdpaAttention(DreamAttention):
             attn_mask=attention_mask if isinstance(attention_mask, torch.Tensor) else None,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False, # hard coded
+            enable_gqa=True,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()

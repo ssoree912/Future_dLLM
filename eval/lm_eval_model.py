@@ -42,7 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def _generation_kwargs(raw: dict, default_max_gen_toks: int) -> dict:
+def _generation_kwargs(raw: dict, default_max_gen_toks: int, dream_decoding=None) -> dict:
     """Take the task's own generation settings and read them as diffusion ones.
 
     Diffusion decoding needs its token budget up front, so the task's
@@ -56,6 +56,10 @@ def _generation_kwargs(raw: dict, default_max_gen_toks: int) -> dict:
     out = dict(raw)
     gen_length = int(out.get("gen_length", out.get("max_gen_toks", default_max_gen_toks)))
     out["gen_length"] = gen_length
+    if dream_decoding is not None:
+        # Autoregressive task defaults must not override Dream's diffusion policy.
+        out.update(dream_decoding.generation_kwargs(gen_length))
+        return out
     out.setdefault("steps", gen_length)
     if not out.get("do_sample", False):
         out["temperature"] = 0.0
@@ -77,6 +81,15 @@ class FutureDLLM(HFLM):
         sampling_eps: float = 1e-3,
         nll_type: str = "mc",
         log_type: str = "ftb",
+        eviction_method: str = "student",
+        dream_alg: str = "entropy",
+        dream_temperature: float = 0.2,
+        dream_top_p: float = 0.95,
+        dream_steps: int = 256,
+        dream_seed: int = 0,
+        dream_eps: float = 1e-3,
+        dream_top_k=None,
+        dream_alg_temp=None,
         **kwargs,
     ):
         from future_dllm import load_model, load_prompt_utility_student
@@ -112,6 +125,26 @@ class FutureDLLM(HFLM):
             str(pretrained), max_seq_len=self._max_seq_len,
             block_length=self._block_len, keep_ratio=self._keep_ratio)
         self._backend = backend
+        if eviction_method not in ("student", "sparse"):
+            raise ValueError("eviction_method must be student or sparse")
+        if eviction_method == "sparse" and backend.name != "dream":
+            raise ValueError("the sparse comparison mode is currently Dream-only")
+        self._eviction_method = eviction_method
+        self._dream_decoding = None
+        self._dream_seed = int(dream_seed)
+        if backend.name == "dream":
+            from future_dllm.dream_decoding import DreamDecoding
+            self._dream_decoding = DreamDecoding(
+                alg=str(dream_alg), temperature=float(dream_temperature),
+                top_p=float(dream_top_p), steps=int(dream_steps), eps=float(dream_eps),
+                top_k=None if dream_top_k is None else int(dream_top_k),
+                alg_temp=None if dream_alg_temp is None else float(dream_alg_temp))
+        self._resume_identity = json.dumps({
+            "model": str(pretrained), "student": student_path, "keep_ratio": self._keep_ratio,
+            "eviction_method": eviction_method, "block_len": self._block_len,
+            "max_seq_len": self._max_seq_len, "max_prompt_len": self._max_prompt_len,
+            "decoding": self._dream_decoding.metadata() if self._dream_decoding else None,
+            "dream_seed": self._dream_seed}, sort_keys=True)
         self._generate = backend.generate
         self._n_layers = backend.n_layers
         self._fallback_mask_id = backend.mask_id
@@ -136,9 +169,14 @@ class FutureDLLM(HFLM):
                 "rerun rather than evaluate on CPU")
 
         self._scorer = None
-        if student_path:
+        if student_path and eviction_method == "student":
+            if self._dream_decoding is not None and self._keep_ratio < 1:
+                from future_dllm.dream_decoding import require_matching_decoding
+                path = Path(student_path) / "decoding.json"
+                saved = json.loads(path.read_text()) if path.is_file() else None
+                require_matching_decoding(saved, self._dream_decoding.metadata(), path)
             self._scorer = load_prompt_utility_student(student_path, device)
-        elif float(keep_ratio) < 1.0:
+        elif float(keep_ratio) < 1.0 and eviction_method == "student":
             raise ValueError(
                 "eviction needs a trained scorer: pass student_path=<checkpoint>, "
                 "or keep_ratio=1.0 to run without eviction")
@@ -154,6 +192,9 @@ class FutureDLLM(HFLM):
               f"max_prompt_len={self._max_prompt_len} "
               f"logit_shift={backend.logit_shift} "
               f"scorer={student_path or 'none (no eviction)'}", flush=True)
+        if self._dream_decoding is not None:
+            print(f"Dream decoding={self._dream_decoding.metadata()} "
+                  f"seed={self._dream_seed} eviction_method={eviction_method}", flush=True)
 
     def _shift(self, logits: torch.Tensor) -> torch.Tensor:
         """Move each row's prediction onto the position it describes.
@@ -274,6 +315,8 @@ class FutureDLLM(HFLM):
                 cache_scorer=self._scorer,
                 prompt_length=prefix_length,
                 generation_length=generation_length,
+                eviction_method=self._eviction_method,
+                baseline_order=self._backend.name == "dream",
             )
             full = self._shift(self.model(model_input, block_start, 1, cache).logits)
             logits = self._shift(self.model(
@@ -356,6 +399,16 @@ class FutureDLLM(HFLM):
         )
 
     def _call_generate(self, context_enc, gen_kwargs, gen_length):
+        if self._dream_decoding is not None:
+            from future_dllm.dream_decoding import sample_seed
+            seed = sample_seed(self._dream_seed, repr(context_enc.tolist()))
+            with torch.random.fork_rng():
+                torch.manual_seed(seed)
+                return self._generate(
+                    self.model, context_enc.to(self.device), gen_length=gen_length,
+                    block_length=self._block_len, mask_id=self._mask_id,
+                    cache_scorer=self._scorer, eviction_method=self._eviction_method,
+                    **self._dream_decoding.generation_kwargs(gen_length))
         return self._generate(
             self.model, context_enc.to(self.device),
             steps=int(gen_kwargs["steps"]), gen_length=gen_length,
@@ -395,12 +448,12 @@ class FutureDLLM(HFLM):
         for request in requests:
             context, raw_kwargs = request.args
             key = hashlib.md5(
-                (context + repr(sorted(raw_kwargs.items()))).encode()).hexdigest()
+                (context + repr(sorted(raw_kwargs.items())) + self._resume_identity).encode()).hexdigest()
             if key in done:
                 results.append(done[key])
                 bar.update(1)
                 continue
-            gen_kwargs = _generation_kwargs(raw_kwargs, self.max_gen_toks)
+            gen_kwargs = _generation_kwargs(raw_kwargs, self.max_gen_toks, self._dream_decoding)
             gen_length = int(gen_kwargs["gen_length"])
             if gen_length % self._block_len:      # blocks have to divide the budget
                 gen_length += self._block_len - gen_length % self._block_len

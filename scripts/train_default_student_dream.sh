@@ -8,6 +8,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
+source "$REPO/scripts/dream_decoding_env.sh"
 # Dream runs at 2048 total, not 4096. The checkpoint's config advertises
 # max_position_embeddings=131072, but that is inherited from the Qwen2.5-7B
 # weights Dream was initialised from, not a trained diffusion context.
@@ -16,7 +17,7 @@ PY="${PY:-python}"
 # Generation lengths stay per-dataset, so the prompt cap is 2048 - gen_length.
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
-TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream_${MAX_SEQ_LEN}}"
+TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream_${MAX_SEQ_LEN}_${DREAM_DECODER_TAG}}"
 EPOCHS="${EPOCHS:-10}"
 LR="${LR:-2e-4}"
 SEED="${SEED:-0}"
@@ -26,7 +27,7 @@ MLP_DIM="${MLP_DIM:-512}"
 PAIRS="${PAIRS:-4096}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-dream_5ds_500-371-150-100-500_e${EPOCHS}_lr${LR}_len${MAX_SEQ_LEN}_${RUN_TAG}}"
+RUN_NAME="${RUN_NAME:-dream_${DREAM_DECODER_TAG}_5ds_500-371-150-100-500_e${EPOCHS}_lr${LR}_len${MAX_SEQ_LEN}_${RUN_TAG}}"
 LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
@@ -61,6 +62,7 @@ printf 'default student training (dream)\nmodel=%s\nteacher=%s\nmax_seq_len=%s\n
   --pairs "$PAIRS" \
   --block-length "$BLOCK_LENGTH" \
   --max-seq-len "$MAX_SEQ_LEN" \
-  --name "$RUN_NAME"
+  --name "$RUN_NAME" \
+  "${DREAM_ARGS[@]}"
 
 echo "default student training (dream) complete"

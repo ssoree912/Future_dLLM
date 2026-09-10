@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
+source "$REPO/scripts/dream_decoding_env.sh"
 # Dream runs at 2048 total, not 4096. The checkpoint's config advertises
 # max_position_embeddings=131072, but that is inherited from the Qwen2.5-7B
 # weights Dream was initialised from, not a trained diffusion context.
@@ -19,7 +20,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
 DATA_ROOT="${FUTURE_DLLM_DATA:-$REPO/data}"
 PROMPT_ROOT="${PROMPT_ROOT:-$REPO/artifacts/prompt_shards_dream_${MAX_SEQ_LEN}}"
-TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream_${MAX_SEQ_LEN}}"
+TEACHER_ROOT="${TEACHER_ROOT:-$REPO/artifacts/teacher_dream_${MAX_SEQ_LEN}_${DREAM_DECODER_TAG}}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_FILE:-$REPO/logs/teacher_extract/extract_default_teacher_dream_${RUN_TAG}.log}"
 
@@ -58,7 +59,8 @@ for index in "${!DATASETS[@]}"; do
     --max-seq-len "$MAX_SEQ_LEN" \
     --model "$MODEL" \
     --shard-root "$PROMPT_ROOT" \
-    --output-root "$TEACHER_ROOT"
+    --output-root "$TEACHER_ROOT" \
+    --seed "$DREAM_SEED" "${DREAM_ARGS[@]}"
 done
 
 echo "default teacher extraction (dream) complete"

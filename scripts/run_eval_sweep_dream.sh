@@ -25,6 +25,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
+source "$REPO/scripts/dream_decoding_env.sh"
 CKPT="${1:?usage: run_eval_sweep_dream.sh <checkpoint>}"
 CKPT="$(cd "$(dirname "$CKPT")" && pwd)/$(basename "$CKPT")"
 
@@ -33,7 +34,7 @@ export MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
-MODEL_TAG="$(basename "$FUTURE_DLLM_MODEL")"
+MODEL_TAG="${FUTURE_DLLM_MODEL_TAG:-$(basename "$FUTURE_DLLM_MODEL")_${DREAM_DECODER_TAG}}"
 METHOD="$(basename "$(dirname "$CKPT")")"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 SWEEP_LOG="$REPO/logs/eval/sweep_dream_${RUN_TAG}.log"

@@ -1,122 +1,128 @@
-"""Block-wise diffusion decoding for Dream, with future-attention cache eviction.
+"""Sparse-dLLM Dream decoding with a selectable cache ranking rule.
 
-Same three cache states and same per-block cache lifetime as ``llada_generate``.
-Two things are Dream's and not LLaDA's, and both come from Dream having been
-adapted from an autoregressive Qwen2 rather than trained masked from scratch:
-
-*Shifted logits.* Row ``r`` predicts token ``r+1``, so the token at position
-``r`` is read from row ``r-1``. Dream's own ``generation_utils`` applies the
-identical one-line shift. Without it the decode still runs and still agrees with
-a no-cache reference -- it just emits text offset by one token, which reads as
-fluent-looking garbage.
-
-*A seeded first token.* Because of that shift, a block cannot be decoded from
-the block's own rows alone: its first token comes from the row before it, which
-a block-only forward does not have. Following Sparse-dLLM, step 0 -- a full
-sequence forward, where that row exists and is correct -- confirms exactly that
-one token before anything else is revealed. From step 2 on, the shift's
-meaningless first row lands on an already-confirmed position and is masked out,
-so the block-only window stays the block itself and the candidate pool is
-identical to the Sparse-dLLM baseline's.
+The sampling order and transfer schedule follow the reference
+``dream/generation_utils.py::DreamGenerationMixin._sample``. Step 0 samples the
+whole block but confirms only its first token; subsequent steps sample masked
+rows and use the remaining-mask timestep schedule. Sampling primitives retain
+the Dream authors' Apache-2.0 implementation in generation_utils.py.
 """
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 from .cache import CustomCache
-from .llada_generate import add_gumbel_noise, get_num_transfer_tokens
+from .dream_decoding import DreamDecoding
+from .generation_utils import sample_tokens
 
-# Dream-org/Dream-v0-Instruct-7B config.mask_token_id. Prefer the value read off
-# the config (``Backend.mask_id``) wherever one is available: LLaDA's 126336 is
-# an ordinary token in Dream's 152k vocabulary, so a mismatched constant masks
-# nothing and raises nothing.
 MASK_ID = 151666
 
 
-def shift_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Move each row's prediction onto the position it describes."""
+def shift_logits(logits):
     return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
 
 @torch.no_grad()
-def generate(model, prompt, steps=128, gen_length=128, block_length=32,
-             temperature=0., cfg_scale=0., remasking='low_confidence',
-             mask_id=MASK_ID, cache_scorer=None):
-    """Generate ``gen_length`` tokens block by block.
+def generate(model, prompt, steps=None, gen_length=128, block_length=32,
+             temperature=0.2, cfg_scale=0., remasking=None,
+             mask_id=MASK_ID, cache_scorer=None, *, alg="entropy", top_p=0.95,
+             top_k=None, alg_temp=None, eps=1e-3, eviction_method="student",
+             on_block_complete=None, on_step=None):
+    """Return prompt + answer using the reference block sampling schedule.
 
-    ``cache_scorer`` is a trained ``PromptUtilityStudent``; without one the model
-    only runs at ``keep_ratio=1.0`` (no eviction). ``keep_ratio`` and the layer
-    count come from ``model.config``.
+    ``on_block_complete(x, cache, block_index, block_start, selection_input)``
+    observes completed blocks for teacher collection. The selection input is
+    the full sequence entering step 1, before cache selection and revelation.
+    ``on_step(x, block_index, step_index)`` supports reference parity checks.
+    Callbacks must not sample or modify x.
     """
-    # filter_cache cuts using config.block_len, fixed at load time, while the
-    # blocks below are built from this call's block_length. If they disagree the
-    # cache drops the wrong columns -- and the candidate-count check that would
-    # catch it is skipped at keep_ratio=1.0, which is exactly the teacher path.
-    assert model.config.block_len == block_length, (
-        f"config.block_len={model.config.block_len} was set for a different "
-        f"block_length than {block_length}")
+    if cfg_scale != 0 or remasking is not None:
+        raise ValueError("Dream uses alg/temperature/top_p, not LLaDA cfg_scale/remasking")
+    if prompt.ndim != 2 or prompt.shape[0] != 1 or prompt.shape[1] < 1:
+        raise ValueError("Dream cache decoding requires one non-empty, unpadded prompt")
+    if block_length < 1 or model.config.block_len != block_length:
+        raise ValueError("block_length must be positive and match model.config.block_len")
+    if gen_length < 1 or gen_length % block_length:
+        raise ValueError("gen_length must be positive and divisible by block_length")
+    if eviction_method not in ("student", "sparse"):
+        raise ValueError("eviction_method must be student or sparse")
+    if model.config.keep_ratio < 1 and eviction_method == "student" and cache_scorer is None:
+        raise ValueError("student eviction requires a scorer")
 
-    prompt_len = prompt.shape[1]
-    x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long,
-                   device=model.device)
-    x[:, :prompt_len] = prompt.clone()
-
-    assert gen_length % block_length == 0
+    settings = DreamDecoding(alg=alg, temperature=temperature, top_p=top_p,
+                             steps=256 if steps is None else steps, eps=eps,
+                             top_k=top_k, alg_temp=alg_temp)
+    steps = settings.steps_for_length(gen_length)
     num_blocks = gen_length // block_length
-    assert steps % num_blocks == 0
+    if steps % num_blocks or steps // num_blocks < 2:
+        raise ValueError("steps must divide into at least two steps per block")
     steps_per_block = steps // num_blocks
+    x = F.pad(prompt, (0, gen_length), value=mask_id)
+    prompt_len = prompt.shape[1]
+    timesteps = torch.linspace(1, eps, steps_per_block + 1, device=x.device)
 
-    for num_block in range(num_blocks):
-        # A fresh cache per block: nothing is carried over, so the selection is
-        # made once against the block that will use it.
+    for block_index in range(num_blocks):
         cache = CustomCache(
             n_layers=model.config.num_hidden_layers, device=model.device,
-            keep_ratio=model.config.keep_ratio,
-            cache_scorer=cache_scorer, prompt_length=prompt_len,
-            generation_length=gen_length)
-
-        block_start = prompt_len + num_block * block_length
-        block_end = prompt_len + (num_block + 1) * block_length
-        num_transfer = get_num_transfer_tokens(
-            x[:, block_start:block_end] == mask_id, steps_per_block)
+            keep_ratio=model.config.keep_ratio, cache_scorer=cache_scorer,
+            prompt_length=prompt_len, generation_length=gen_length,
+            eviction_method=eviction_method, baseline_order=True)
+        cache.collect_pool = on_block_complete is not None
+        if cache.collect_pool and model.config.keep_ratio != 1.0:
+            raise ValueError("teacher collection requires keep_ratio=1.0")
+        bs = prompt_len + block_index * block_length
+        be = bs + block_length
+        selection_input = None
 
         for i in range(steps_per_block):
-            cache_state = 2 if i > 1 else i
-            model_input = x if cache_state != 2 else x[:, block_start:block_end]
-            mask_index = (model_input == mask_id)
-
-            logits = model(model_input, block_start, cache_state, cache).logits
+            cache_state = min(i, 2)
+            model_input = x if cache_state != 2 else x[:, bs:be]
+            if i == 1 and on_block_complete is not None:
+                selection_input = x.clone()
+            logits = model(input_ids=model_input, position_offset=bs,
+                           cache_state=cache_state, customcache=cache,
+                           attention_mask="full", position_ids=None).logits
             logits = shift_logits(logits)
-            x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)
 
-            if remasking == 'low_confidence':
-                p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(torch.gather(p, -1, torch.unsqueeze(x0, -1)), -1)
-            elif remasking == 'random':
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-            else:
-                raise NotImplementedError(remasking)
-
-            target = x if cache_state != 2 else x[:, block_start:block_end]
-            if cache_state != 2:
-                x0_p[:, block_end:] = -np.inf
-            x0 = torch.where(mask_index, x0, target)
-            confidence = torch.where(mask_index, x0_p, torch.full_like(x0_p, -np.inf))
             if cache_state == 0:
-                # Seed the block's first token from the one forward that can
-                # read it. +inf puts it at the head of this step's top-k rather
-                # than adding a reveal, so the schedule's budget is unchanged.
-                #
-                # At the default steps == gen_length this reveals exactly that
-                # one token, matching Sparse-dLLM's step 0. With fewer steps the
-                # schedule's first budget is larger, so step 0 also reveals the
-                # next num_transfer[0]-1 by confidence where the baseline would
-                # reveal only the seed -- worth knowing before comparing runs at
-                # a non-default --steps.
-                confidence[:, block_start] = np.inf
-            for j in range(confidence.shape[0]):
-                reveal = torch.topk(confidence[j], k=num_transfer[j, i]).indices
-                target[j, reveal] = x0[j, reveal]
+                _, x0 = sample_tokens(logits[:, bs:be], temperature=temperature,
+                                      top_p=top_p, top_k=top_k)
+                x[:, bs] = x0[:, 0]
+                if on_step is not None:
+                    on_step(x, block_index, i)
+                continue
 
+            if cache_state == 1:
+                model_input = model_input[:, bs:be]
+                logits = logits[:, bs:be]
+            mask_index = model_input == mask_id
+            mask_logits = logits[mask_index]
+            confidence, x0 = sample_tokens(
+                mask_logits, temperature=temperature, top_p=top_p, top_k=top_k,
+                margin_confidence=alg == "topk_margin", neg_entropy=alg == "entropy")
+            t, s = timesteps[i], timesteps[i + 1]
+            num_mask_token = mask_index.sum() / mask_index.shape[0]
+            number_transfer_tokens = (
+                int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1
+                else int(num_mask_token))
+            block_confidence = torch.full_like(model_input, -torch.inf,
+                                               device=model.device, dtype=logits.dtype)
+            block_confidence[mask_index] = confidence
+            if number_transfer_tokens > 0:
+                if alg_temp is None or alg_temp == 0:
+                    _, transfer_index = torch.topk(block_confidence, number_transfer_tokens)
+                else:
+                    block_confidence = F.softmax(block_confidence / alg_temp, dim=-1)
+                    transfer_index = torch.multinomial(
+                        block_confidence, num_samples=number_transfer_tokens)
+                x_block = torch.zeros_like(model_input, device=model.device,
+                                           dtype=torch.long) + mask_id
+                x_block[mask_index] = x0.clone()
+                row_indices = torch.arange(model_input.size(0), device=model.device)
+                row_indices = row_indices.unsqueeze(1).expand_as(transfer_index)
+                x[:, bs:be][row_indices, transfer_index] = x_block[row_indices, transfer_index]
+            if on_step is not None:
+                on_step(x, block_index, i)
+
+        if on_block_complete is not None:
+            on_block_complete(x, cache, block_index, bs, selection_input)
     return x

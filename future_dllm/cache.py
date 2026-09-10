@@ -97,8 +97,15 @@ class CustomCache:
         generation_length: int = 0,
         capture_current_scores: bool = False,
         current_score_pool_kernel: Optional[int] = 3,
+        eviction_method: str = "student",
+        baseline_order: bool = False,
     ) -> None:
+        if eviction_method not in ("student", "sparse"):
+            raise ValueError("eviction_method must be student or sparse")
         self.cache = {}
+        self.eviction_method = eviction_method
+        self.baseline_order = baseline_order
+        self.candidate_order = {}
         self.keep_ratios = [keep_ratio for _ in range(n_layers)]
         self.cache_scorer = cache_scorer
         self.prompt_length = prompt_length
@@ -143,7 +150,13 @@ class CustomCache:
         scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / (q.size(-1) ** 0.5)
         weights = torch.softmax(scores, dim=-1)
         n_cand = k.size(-2) - q.size(-2)
-        self.pending_rows[layer_id] = weights[..., :n_cand].mean(dim=1).squeeze(0)
+        rows = weights[..., :n_cand].mean(dim=1).squeeze(0)
+        if layer_id in self.candidate_order:
+            # Decode in score order, but keep teacher columns in natural order.
+            natural_rows = torch.empty_like(rows)
+            natural_rows[:, self.candidate_order[layer_id]] = rows
+            rows = natural_rows
+        self.pending_rows[layer_id] = rows
 
     def capture_layer_hidden_states(self, layer_id: int, hidden_states: torch.Tensor) -> None:
         if self.cache_scorer is not None:
@@ -173,7 +186,20 @@ class CustomCache:
                 q_block, keep_k, self.current_score_pool_kernel
             ).detach()
 
-        if self.collect_pool or self.keep_ratios[layer_id] >= 1.0:
+        full_pool = self.collect_pool or self.keep_ratios[layer_id] >= 1.0
+        if self.eviction_method == "sparse" or (full_pool and self.baseline_order):
+            scores = sparse_dllm_current_score(q_block, keep_k, self.current_score_pool_kernel)
+            keep_num = keep_k.size(-2) if full_pool else int(
+                keep_k.size(-2) * self.keep_ratios[layer_id])
+            indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
+            if self.collect_pool:
+                self.candidate_order[layer_id] = indices
+            head_index = torch.arange(keep_k.size(1), device=keep_k.device)[:, None]
+            self.cache[layer_id] = {"k": keep_k[:, head_index, indices],
+                                    "v": keep_v[:, head_index, indices]}
+            return
+
+        if full_pool:
             # Nothing is evicted: keep the pool in candidate order so recorded
             # attention columns line up with the entries they belong to.
             self.cache[layer_id] = {"k": keep_k, "v": keep_v}
@@ -210,7 +236,9 @@ class CustomCache:
             layer_id, hidden_states.float(), candidate_indices,
             head="score", block_indices=block_indices).float()
         keep_num = int(candidate_indices.numel() * self.keep_ratios[layer_id])
-        keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0).sort().values
+        keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
+        if not self.baseline_order:
+            keep_indices = keep_indices.sort().values
 
         if self.keep_log:
             kept = candidate_indices[keep_indices]
@@ -233,5 +261,4 @@ class CustomCache:
 
     def clear(self):
         self.cache.clear()
-
 

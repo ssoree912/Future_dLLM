@@ -65,6 +65,9 @@ def parse_args(family, description):
                    help="maximum prompt + generation length (default: 4096)")
     p.add_argument("--max-prompt-len", type=int, default=None,
                    help="optional stricter prompt-only cap")
+    p.add_argument("--seed", type=int, default=0)
+    from future_dllm.dream_decoding import add_dream_arguments
+    add_dream_arguments(p)
     p.add_argument(
         "--save-attention-rows",
         action="store_true",
@@ -110,6 +113,8 @@ def parse_args(family, description):
 
 @torch.no_grad()
 def collect(model, prompt_ids, args, backend):
+    if backend.name == "dream":
+        return collect_dream(model, prompt_ids, args, backend)
     from future_dllm import CustomCache, add_gumbel_noise, get_num_transfer_tokens
 
     device = model.device
@@ -219,6 +224,49 @@ def collect(model, prompt_ids, args, backend):
     return records
 
 
+@torch.no_grad()
+def collect_dream(model, prompt_ids, args, backend):
+    """Use the deployment decoder; observing completed attention consumes no RNG."""
+    from future_dllm.dream_decoding import DreamDecoding
+    from future_dllm.dream_generate import generate
+
+    settings = DreamDecoding.from_args(args)
+    prompt = prompt_ids[-args.prompt_limit:].to(model.device).unsqueeze(0)
+    records = []
+
+    def completed(x, cache, block_index, bs, selection_input):
+        be = bs + args.block_length
+        cache.capture_rows = True
+        model(input_ids=x[:, bs:be], position_offset=bs, cache_state=2,
+              customcache=cache, attention_mask="full")
+        cache.capture_rows = False
+        rows = [cache.pending_rows[layer] for layer in range(backend.n_layers)]
+        label = torch.stack([row.max(dim=0).values for row in rows])
+        candidates = torch.cat([torch.arange(bs), torch.arange(be, x.shape[1])])
+        record = {
+            "block_index": block_index, "block_start": bs,
+            "block_length": args.block_length, "window_start": bs,
+            "window_length": args.block_length, "seed_block_start": True,
+            "backend": "dream", "prompt_length": prompt.shape[1],
+            "gen_length": args.gen_length,
+            "steps_per_block": settings.steps_for_length(args.gen_length)
+                               // (args.gen_length // args.block_length),
+            "x_at_block_start": selection_input[0].cpu(),
+            "candidate_indices": candidates,
+            "completed_block_ids": x[0, bs:be].cpu().clone(),
+            "label_final_rowmax": label.to(torch.float16).cpu(),
+        }
+        if args.save_attention_rows:
+            record["future_attention_rows"] = torch.stack(rows).to(torch.float16).cpu()
+        cache.pending_rows.clear()
+        records.append(record)
+
+    generate(model, prompt, gen_length=args.gen_length, block_length=args.block_length,
+             mask_id=backend.mask_id, on_block_complete=completed,
+             **settings.generation_kwargs(args.gen_length))
+    return records
+
+
 def run(family, description):
     """Entry point body, called by the two family scripts."""
     sys.path.insert(0, str(REPO_ROOT))
@@ -236,6 +284,12 @@ def run(family, description):
     print(f"backend={backend.name} layers={backend.n_layers} "
           f"mask_id={backend.mask_id} logit_shift={backend.logit_shift} "
           f"seed_block_start={backend.seed_block_start}", flush=True)
+    decoding = None
+    if family == "dream":
+        from future_dllm.dream_decoding import (
+            DreamDecoding, require_matching_decoding, sample_seed)
+        decoding = DreamDecoding.from_args(args).metadata()
+        print(f"decoding={decoding} seed={args.seed}", flush=True)
 
     out = Path(args.output_root) / args.dataset
     out.mkdir(parents=True, exist_ok=True)
@@ -254,6 +308,10 @@ def run(family, description):
         # Old 2048 labels are therefore rebuilt after their prompt shards grow.
         if target.exists():
             saved = torch.load(target, map_location="cpu", weights_only=False)
+            if decoding is not None:
+                require_matching_decoding(saved.get("decoding"), decoding, target)
+                if saved.get("seed") != args.seed:
+                    raise ValueError(f"{target}: teacher seed differs; use a new output root")
             blocks = saved.get("blocks") or []
             # The backend check matters as much as the lengths: a Dream and a
             # LLaDA shard for the same sample can agree on every length and
@@ -270,7 +328,13 @@ def run(family, description):
                 continue
             print(f"rebuilding mismatched teacher shard: {target.name}", flush=True)
         added += 1
-        records = collect(model, prompt_ids, args, backend)
+        if decoding is not None:
+            item_seed = sample_seed(args.seed, f"{args.dataset}/{Path(path).stem}")
+            with torch.random.fork_rng():
+                torch.manual_seed(item_seed)
+                records = collect(model, prompt_ids, args, backend)
+        else:
+            records = collect(model, prompt_ids, args, backend)
         payload = {"sample_id": src.get("sample_id"),
                    "dataset": args.dataset,
                    "backend": backend.name,
@@ -282,6 +346,8 @@ def run(family, description):
                    "teacher_kind": "final_rowmax",
                    "attention_rows_saved": args.save_attention_rows,
                    "blocks": records}
+        if decoding is not None:
+            payload.update(decoding=decoding, seed=args.seed, sample_seed=item_seed)
         temporary = target.with_suffix(target.suffix + ".tmp")
         torch.save(payload, temporary)
         os.replace(temporary, target)
