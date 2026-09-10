@@ -187,11 +187,22 @@ class FutureDLLM(HFLM):
             raise RuntimeError(
                 f"tokenizer mask_token_id {int(tokenizer_mask)} disagrees with the "
                 f"{backend.name} config's {backend.mask_id}")
+        # Say what actually happens, not what the scorer field alone implies:
+        # eviction_method=sparse evicts with the baseline's attention score and
+        # carries no checkpoint, so "scorer=none" there does not mean no
+        # eviction. A log that reads "no eviction" on an evicting run is how a
+        # baseline row gets mistaken for a full-cache one.
+        if float(keep_ratio) >= 1.0:
+            eviction = "none (keep_ratio=1.0)"
+        elif eviction_method == "sparse":
+            eviction = "sparse (baseline attention score, no checkpoint)"
+        else:
+            eviction = f"student ({student_path})"
         print(f"[{backend.name}_future] keep_ratio={keep_ratio} block_len={block_len} "
               f"max_seq_len={self._max_seq_len} "
               f"max_prompt_len={self._max_prompt_len} "
               f"logit_shift={backend.logit_shift} "
-              f"scorer={student_path or 'none (no eviction)'}", flush=True)
+              f"eviction={eviction}", flush=True)
         if self._dream_decoding is not None:
             print(f"Dream decoding={self._dream_decoding.metadata()} "
                   f"seed={self._dream_seed} eviction_method={eviction_method}", flush=True)
