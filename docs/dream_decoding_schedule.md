@@ -57,8 +57,11 @@ number_transfer_tokens = int(num_mask_token * (1 - s / t))  # 마지막 스텝�
 
 ## Sparse-dLLM 이 Dream 원본에서 바꾼 것
 
-`baselines/sparse_dllm/dream/generation_utils.py` (원격 브랜치에 벤더링됨) 와
-원본을 비교하면 다음이 전부다.
+Sparse-dLLM 의 Dream 구현과 원본을 비교하면 다음이 전부다. 그 구현은 이 브랜치에
+없다 - 레퍼런스 체크아웃
+(`/home/M2026107/dllm/Sparse-dLLM/opencompass/models/sparse_dllm/dream/`) 이나,
+`origin/feat#2/dream_instruct_ours` 에 벤더링된
+`baselines/sparse_dllm/dream/generation_utils.py` 를 보면 된다.
 
 | | Dream 원본 | Sparse-dLLM |
 |---|---|---|
@@ -122,27 +125,30 @@ steps_per_block=8
 
 `steps == gen_length` 일 때 두 스케줄은 step 1(0 vs 1)과 마지막(2 vs 1)만 다르다.
 그런데 그 한 칸 밀림이 이후 모든 스텝의 문맥을 바꾸므로 결과 토큰은 거의 전부
-달라질 수 있다. 이것이 `future_dllm/sparse_dllm_student.py` 가 기록한
-GSM8K 4개 프롬프트 63/64, 58/64, 13/64, 57/64 불일치의 정체다. 스텝 수를 줄일수록
-초반부터 어긋나서 격차가 커진다 (13/64).
+달라질 수 있다. 이것이 GSM8K 4개 프롬프트에서 63/64, 58/64, 13/64, 57/64 만
+일치했던 것의 정체다. 스텝 수를 줄일수록 초반부터 어긋나서 격차가 커진다.
+측정 기록은 `origin/feat#2/dream_instruct_ours` 의
+`future_dllm/sparse_dllm_student.py` docstring 에 있다.
 
 `alg="entropy"` 만 맞추고 스케줄을 그대로 두면 이 불일치는 사라지지 않는다.
 **reveal 개수 규칙 자체를 옮겨야 한다.**
 
 ## 현재 상태
 
-`future_dllm/dream_generate.py` (미커밋) 가 위 스케줄을 그대로 이식했고,
-`scripts/check_dream_decoding.py` 로 레퍼런스 구현과 대조했다:
+`future_dllm/dream_generate.py` 가 위 스케줄을 그대로 이식했다
+(`feat#3/dream_sparse_decoding` 의 2e27e53).
+
+대조는 `scripts/check_dream_decoding.py` 가 한다. 레퍼런스 체크아웃을 import 해
+같은 프롬프트를 양쪽으로 디코드하고 최종 토큰, 중간 history, RNG 소비량을 비교한다.
+2026-09-10 실행 결과는 두 스케줄(gen64/steps64, gen64/steps32) 모두
+`tokens_equal` / `history_equal` / `rng_equal` 이 참이고 `passed: true` 였다.
+출력은 `--output` 으로 지정한 곳에 남는데 그 경로가 `logs/` 아래면 커밋되지
+않으므로(.gitignore:13), 재확인이 필요하면 스크립트를 다시 돌리는 편이 빠르다:
 
 ```
-logs/runs/dream_sparse_teacher_20260910_145513/check.json
-  reference_root: /home/M2026107/dllm/Sparse-dLLM/opencompass/models/sparse_dllm/dream
-  gen64/steps64 : tokens_equal ✓  history_equal ✓  rng_equal ✓
-  gen64/steps32 : tokens_equal ✓  history_equal ✓  rng_equal ✓
-  passed: true
+python scripts/check_dream_decoding.py \
+  --model model/Dream-v0-Instruct-7B --output <경로>/check.json
 ```
-
-최종 토큰뿐 아니라 중간 history 와 RNG 소비량까지 일치한다.
 
 ## 용어 주의
 
