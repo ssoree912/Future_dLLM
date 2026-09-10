@@ -24,9 +24,14 @@ Both execute the same files. At ``keep_ratio=1.0`` the scorer is never reached
 and the two are bit-identical -- verified on five GSM8K prompts -- so one
 no-eviction run serves as the reference for both.
 
-Multiple-choice tasks are out of reach here: their model has no likelihood
-path (Sparse-dLLM scores MMLU/ARC-C/PIQA/GPQA generatively), and adding one
-would be our code again.
+Multiple choice follows lm-eval's own convention for `output_type:
+multiple_choice` -- score every choice by loglikelihood, take the largest --
+through the shared `DiffusionLikelihoodMixin`. Sparse-dLLM scores those
+benchmarks generatively in OpenCompass instead, so this column is not directly
+comparable to their published numbers; it is comparable between the rows here,
+which is what the table needs. Nothing about decoding enters that path: the
+estimator only masks and runs forwards, so `alg`, temperature and the reveal
+schedule never apply and the two rows differ in eviction alone.
 """
 
 from __future__ import annotations
@@ -47,11 +52,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from eval.diffusion_likelihood import DiffusionLikelihoodMixin  # noqa: E402
 from eval.lm_eval_model import _generation_kwargs  # noqa: E402
 
 
 @register_model("Sparse_dLLM_Dream")
-class SparseDLLMDream(HFLM):
+class SparseDLLMDream(DiffusionLikelihoodMixin, HFLM):
     def __init__(
         self,
         pretrained: str,
@@ -65,6 +71,8 @@ class SparseDLLMDream(HFLM):
         temperature: float = 0.2,
         top_p: float = 0.95,
         alg_temp: float = 0.0,
+        diffusion_steps: int = 32,
+        sampling_eps: float = 1e-3,
         **kwargs,
     ):
         from future_dllm import load_prompt_utility_student
@@ -79,6 +87,9 @@ class SparseDLLMDream(HFLM):
         self._temperature = float(temperature)
         self._top_p = None if top_p is None or float(top_p) <= 0 else float(top_p)
         self._alg_temp = float(alg_temp)
+        self._diffusion_steps = int(diffusion_steps)
+        self._sampling_eps = float(sampling_eps)
+        self._logit_shift = True            # Dream predicts token r+1 from row r
 
         if not 0.0 < self._keep_ratio <= 1.0:
             raise ValueError("keep_ratio must be in (0, 1]")
@@ -103,6 +114,8 @@ class SparseDLLMDream(HFLM):
         # Chooses what the caches their generate builds will rank with.
         scorer = load_prompt_utility_student(student_path, device) if student_path else None
         set_scorer(scorer)
+        self._scorer = scorer
+        self._kernel_size = int(kernel_size)
         self._scorer_path = student_path or "none (their attention score)"
 
         print(f"[Sparse_dLLM_Dream] scorer={self._scorer_path} "
@@ -111,14 +124,32 @@ class SparseDLLMDream(HFLM):
               f"max_seq_len={self._max_seq_len} alg={self._alg} "
               f"temperature={self._temperature} top_p={self._top_p}", flush=True)
 
-    def loglikelihood(self, requests, disable_tqdm: bool = False):
-        raise NotImplementedError(
-            "Sparse-dLLM's Dream code has no likelihood path; it scores "
-            "multiple choice generatively. Use the future_dllm model with "
-            "selection=sparse_dllm for loglikelihood tasks.")
+    # -- DiffusionLikelihoodMixin hooks ------------------------------------
+    def _shift(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
-    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
-        raise NotImplementedError("not defined for the diffusion evaluator")
+    @property
+    def _mask_id(self) -> int:
+        return int(self.model.config.mask_token_id)
+
+    @property
+    def _n_layers(self) -> int:
+        return int(self.model.config.num_hidden_layers)
+
+    def _make_cache(self, keep_ratio, prompt_length, generation_length):
+        """Their cache, or their cache with the scorer, exactly as generate does."""
+        from baselines.sparse_dllm.dream.Cache import CustomCache
+        from future_dllm.sparse_dllm_student import StudentScorerCache
+        if self._scorer is None:
+            return CustomCache(n_layers=self._n_layers, device=self.device,
+                               kernel_size=self._kernel_size, keep_ratio=keep_ratio)
+        return StudentScorerCache(n_layers=self._n_layers, device=self.device,
+                                  kernel_size=self._kernel_size,
+                                  keep_ratio=keep_ratio, cache_scorer=self._scorer)
+
+    def _forward(self, input_ids, position_offset, cache_state, cache):
+        return self.model(position_offset=position_offset, cache_state=cache_state,
+                          customcache=cache, input_ids=input_ids).logits
 
     @torch.no_grad()
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:

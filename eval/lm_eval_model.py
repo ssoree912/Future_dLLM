@@ -36,6 +36,8 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
 
+from eval.diffusion_likelihood import DiffusionLikelihoodMixin
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = REPO_ROOT / "model" / "LLaDA-8B-Instruct"
 if str(REPO_ROOT) not in sys.path:
@@ -63,7 +65,7 @@ def _generation_kwargs(raw: dict, default_max_gen_toks: int) -> dict:
 
 
 @register_model("LLaDA_future", "Dream_future")
-class FutureDLLM(HFLM):
+class FutureDLLM(DiffusionLikelihoodMixin, HFLM):
     def __init__(
         self,
         pretrained: str = str(DEFAULT_MODEL),
@@ -115,6 +117,7 @@ class FutureDLLM(HFLM):
             block_length=self._block_len, keep_ratio=self._keep_ratio,
             selection=self._selection)
         self._backend = backend
+        self._logit_shift = backend.logit_shift
         self._generate = backend.generate
         self._n_layers = backend.n_layers
         self._fallback_mask_id = backend.mask_id
@@ -160,206 +163,31 @@ class FutureDLLM(HFLM):
               f"logit_shift={backend.logit_shift} "
               f"scorer={student_path or 'none (no eviction)'}", flush=True)
 
+    # -- DiffusionLikelihoodMixin hooks ------------------------------------
     def _shift(self, logits: torch.Tensor) -> torch.Tensor:
         """Move each row's prediction onto the position it describes.
 
         Dream was adapted from an autoregressive Qwen2, so row r predicts token
         r+1. LLaDA predicts in place and this is the identity.
         """
-        if not self._backend.logit_shift:
+        if not self._logit_shift:
             return logits
         return torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+    def _make_cache(self, keep_ratio, prompt_length, generation_length):
+        from future_dllm import CustomCache
+        return CustomCache(
+            n_layers=self._n_layers, device=self.device, keep_ratio=keep_ratio,
+            selection=self._selection, cache_scorer=self._scorer,
+            prompt_length=prompt_length, generation_length=generation_length)
+
+    def _forward(self, input_ids, position_offset, cache_state, cache):
+        return self.model(input_ids, position_offset, cache_state, cache).logits
 
     @property
     def _mask_id(self) -> int:
         token_id = getattr(self.tokenizer, "mask_token_id", None)
         return self._fallback_mask_id if token_id is None else int(token_id)
-
-    def _encode_pair(self, context: str, continuation: str) -> Tuple[list[int], list[int]]:
-        """Tokenize a request without breaking tokens across the text boundary."""
-        trailing_spaces = len(context) - len(context.rstrip())
-        if trailing_spaces:
-            continuation = context[-trailing_spaces:] + continuation
-            context = context[:-trailing_spaces]
-
-        whole = self.tokenizer.encode(
-            context + continuation, add_special_tokens=False
-        )
-        prefix = self.tokenizer.encode(context, add_special_tokens=False)
-        target = whole[len(prefix):]
-        if self.tokenizer.eos_token_id is not None:
-            target.append(int(self.tokenizer.eos_token_id))
-
-        reserved_target = len(target)
-        if self._keep_ratio < 1.0:
-            reserved_target = (
-                (reserved_target + self._block_len - 1) // self._block_len
-            ) * self._block_len
-        if reserved_target >= self._max_seq_len:
-            raise ValueError(
-                f"continuation needs {reserved_target} tokens, exceeding "
-                f"max_seq_len {self._max_seq_len}"
-            )
-        prefix_limit = min(self._max_prompt_len, self._max_seq_len - reserved_target)
-        prefix = prefix[-prefix_limit:]
-        if not prefix:
-            prefix = [int(self.prefix_token_id)]
-        return prefix, target
-
-    def _forward_process(self, batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample the forward diffusion process used by LLaDA's evaluator."""
-        batch_size, seq_len = batch.shape
-        offset = torch.rand(1, device=batch.device, dtype=torch.float32)
-        strata = torch.arange(batch_size, device=batch.device, dtype=torch.float32)
-        time = (offset + strata / batch_size) % 1
-        mask_probability = (
-            (1.0 - self._sampling_eps) * time + self._sampling_eps
-        ).unsqueeze(1).expand(batch_size, seq_len)
-        mask = torch.rand((batch_size, seq_len), device=batch.device) < mask_probability
-        mask[:, 0] = False
-        mask[:, -1] = False
-        noisy = torch.where(mask, self._mask_id, batch)
-        return noisy, mask_probability
-
-    @torch.no_grad()
-    def _full_sequence_logits(self, batch: torch.Tensor) -> torch.Tensor:
-        from future_dllm import CustomCache
-
-        cache = CustomCache(
-            n_layers=self._n_layers,
-            device=batch.device,
-            keep_ratio=1.0,
-        )
-        # Token i is denoised from row i, as in the generation loop -- after the
-        # backend's shift has put each row on the position it describes.
-        return self._shift(self.model(batch, 0, 0, cache).logits)
-
-    @torch.no_grad()
-    def _sparse_target_logits(
-        self,
-        clean: torch.Tensor,
-        noisy: torch.Tensor,
-        prefix_length: int,
-        target_length: int,
-    ) -> torch.Tensor:
-        """Score a candidate using generation-equivalent sparse block states."""
-        from future_dllm import CustomCache
-
-        if clean.shape[0] != 1:
-            raise RuntimeError("sparse likelihood requires batch_size=1")
-
-        generation_length = (
-            (target_length + self._block_len - 1) // self._block_len
-        ) * self._block_len
-        padding = generation_length - target_length
-        if padding:
-            pad = torch.full(
-                (1, padding), self._mask_id, dtype=clean.dtype, device=clean.device
-            )
-            clean = torch.cat([clean, pad], dim=1)
-            noisy = torch.cat([noisy, pad], dim=1)
-
-        block_logits = []
-        for local_start in range(0, generation_length, self._block_len):
-            block_start = prefix_length + local_start
-            block_end = block_start + self._block_len
-
-            # Match block-wise generation: completed blocks are confirmed and
-            # blocks after the current one have not begun denoising yet.
-            model_input = noisy.clone()
-            model_input[:, prefix_length:block_start] = clean[
-                :, prefix_length:block_start
-            ]
-            model_input[:, block_end:] = self._mask_id
-
-            cache = CustomCache(
-                n_layers=self._n_layers,
-                device=model_input.device,
-                keep_ratio=self._keep_ratio,
-                selection=self._selection,
-                cache_scorer=self._scorer,
-                prompt_length=prefix_length,
-                generation_length=generation_length,
-            )
-            full = self._shift(self.model(model_input, block_start, 1, cache).logits)
-            logits = self._shift(self.model(
-                model_input[:, block_start:block_end], block_start, 2, cache
-            ).logits)
-            if self._backend.logit_shift:
-                # Under the shift a block cannot supply its own first row: that
-                # token is described by the row before the block, which the
-                # block-only forward does not hold. Generation solves this by
-                # confirming block_start on the step-0 full forward; the same
-                # full forward is right here, and it is the one just run to
-                # build the cache.
-                logits = torch.cat([full[:, block_start:block_start + 1],
-                                    logits[:, 1:]], dim=1)
-            valid_length = min(self._block_len, target_length - local_start)
-            block_logits.append(logits[:, :valid_length])
-
-        return torch.cat(block_logits, dim=1)
-
-    @torch.no_grad()
-    def _eval_target_nll_mc(self, prefix: list[int], target: list[int]) -> float:
-        sequence = torch.tensor(prefix + target, dtype=torch.long, device=self.device)
-        sparse = self._keep_ratio < 1.0
-        likelihood_batch_size = 1 if sparse else int(self.batch_size)
-        accumulated_loss = 0.0
-        completed = 0
-
-        while completed < self._diffusion_steps:
-            current_batch_size = min(
-                likelihood_batch_size, self._diffusion_steps - completed
-            )
-            clean = sequence.unsqueeze(0).repeat(current_batch_size, 1)
-            noisy, mask_probability = self._forward_process(clean)
-            perturbed = clean.clone()
-            perturbed[:, -len(target):] = noisy[:, -len(target):]
-            masked = perturbed.eq(self._mask_id)
-
-            if sparse:
-                logits = self._sparse_target_logits(
-                    clean,
-                    perturbed,
-                    prefix_length=len(prefix),
-                    target_length=len(target),
-                )
-                labels = clean[:, -len(target):]
-                masked = masked[:, -len(target):]
-                mask_probability = mask_probability[:, -len(target):]
-            else:
-                logits = self._full_sequence_logits(perturbed)
-                labels = clean
-            token_loss = F.cross_entropy(
-                logits[masked], labels[masked], reduction="none"
-            )
-            weighted_loss = token_loss / mask_probability[masked]
-            batch_loss = weighted_loss.sum() / current_batch_size
-            accumulated_loss += float(batch_loss) * current_batch_size
-            completed += current_batch_size
-
-        return accumulated_loss / completed
-
-    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        """Score continuations with full or student-pruned diffusion NLL."""
-        from tqdm import tqdm
-
-        results = []
-        iterator = tqdm(
-            requests,
-            disable=self.rank != 0,
-            desc=f"{self._backend.name} diffusion loglikelihood",
-        )
-        for request in iterator:
-            prefix, target = self._encode_pair(*request.args)
-            nll = self._eval_target_nll_mc(prefix, target)
-            results.append((-nll, False))
-        return results
-
-    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
-        raise NotImplementedError(
-            "rolling likelihood is not defined for the diffusion evaluator"
-        )
 
     def _call_generate(self, context_enc, gen_kwargs, gen_length):
         return self._generate(
