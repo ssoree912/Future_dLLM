@@ -37,13 +37,21 @@ def get_num_transfer_tokens(mask_index, steps):
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=32,
              temperature=0., cfg_scale=0., remasking='low_confidence',
-             mask_id=MASK_ID, cache_scorer=None):
+             mask_id=MASK_ID, cache_scorer=None, *, eviction_method="student"):
     """Generate ``gen_length`` tokens block by block.
 
     ``cache_scorer`` is a trained ``PromptUtilityStudent``; without one the model
     only runs at ``keep_ratio=1.0`` (no eviction). ``keep_ratio`` comes from
     ``model.config``.
+
+    ``eviction_method`` picks what decides the eviction: ``"student"`` uses the
+    trained scorer, ``"sparse"`` uses Sparse-dLLM's attention score, which is
+    what makes the baseline row runnable on this backend too.
     """
+    if eviction_method not in ("student", "sparse"):
+        raise ValueError("eviction_method must be student or sparse")
+    if model.config.keep_ratio < 1 and eviction_method == "student" and cache_scorer is None:
+        raise ValueError("student eviction requires a scorer")
     prompt_len = prompt.shape[1]
     x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long,
                    device=model.device)
@@ -57,11 +65,18 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
     for num_block in range(num_blocks):
         # A fresh cache per block: nothing is carried over, so the selection is
         # made once against the block that will use it.
+        # baseline_order matches Sparse-dLLM at keep_ratio=1.0. Their
+        # modeling_llada.filter_cache scores and top-k's unconditionally, so
+        # even when the budget keeps everything the survivors come back ordered
+        # by importance, not by position. Keeping natural order there changes
+        # the order of the float sums in attention and, through sampling, the
+        # tokens -- the same divergence the Dream path hit.
         cache = CustomCache(
             n_layers=model.config.n_layers, device=model.device,
             keep_ratio=model.config.keep_ratio,
             cache_scorer=cache_scorer, prompt_length=prompt_len,
-            generation_length=gen_length)
+            generation_length=gen_length,
+            eviction_method=eviction_method, baseline_order=True)
 
         block_start = prompt_len + num_block * block_length
         block_end = prompt_len + (num_block + 1) * block_length

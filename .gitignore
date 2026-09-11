@@ -19,3 +19,4 @@ data/*
 !data/README.md
 outputs/
 tmp/
+model/

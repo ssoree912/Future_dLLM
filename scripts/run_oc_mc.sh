@@ -9,6 +9,8 @@
 #   scripts/run_oc_mc.sh smoke     # 2 items per dataset, student row only
 #   scripts/run_oc_mc.sh           # GPQA + ARC-C + PIQA, all three rows
 #   scripts/run_oc_mc.sh mmlu      # MMLU alone -- four fifths of the cost
+#   scripts/run_oc_mc.sh llada     # the LLaDA rows (needs a LLaDA checkpoint)
+#   scripts/run_oc_mc.sh llada-mmlu
 #
 # Env: FUTURE_DLLM_MODEL, FUTURE_DLLM_STUDENT, CUDA_VISIBLE_DEVICES.
 set -euo pipefail
@@ -22,7 +24,14 @@ cd "$REPO"
 OC_PYTHON="${OC_PYTHON:-/workspace/dllm/oc/ocenv/bin/python}"
 
 export FUTURE_DLLM_MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
-export FUTURE_DLLM_STUDENT="${FUTURE_DLLM_STUDENT:?set FUTURE_DLLM_STUDENT to a checkpoint-best directory}"
+if [[ "${1:-}" == llada* ]]; then
+  # The LLaDA wrapper reads its own pair of variables, so a Dream checkpoint
+  # can never be handed to a LLaDA run by accident.
+  export FUTURE_DLLM_LLADA_MODEL="${FUTURE_DLLM_LLADA_MODEL:?set FUTURE_DLLM_LLADA_MODEL}"
+  export FUTURE_DLLM_LLADA_STUDENT="${FUTURE_DLLM_LLADA_STUDENT:-}"
+else
+  export FUTURE_DLLM_STUDENT="${FUTURE_DLLM_STUDENT:?set FUTURE_DLLM_STUDENT to a checkpoint-best directory}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 # The config does `from eval_oc.model import DreamFutureOC`, and each task runs
 # in its own subprocess, so the repo has to be importable from the environment.
@@ -31,6 +40,8 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 case "${1:-}" in
   smoke) CONFIG="eval_oc/configs/eval_dream_mc_smoke.py"; shift ;;
   mmlu)  CONFIG="eval_oc/configs/eval_dream_mmlu.py";     shift ;;
+  llada) CONFIG="eval_oc/configs/eval_llada_mc.py";       shift ;;
+  llada-mmlu) CONFIG="eval_oc/configs/eval_llada_mmlu.py"; shift ;;
   *)     CONFIG="eval_oc/configs/eval_dream_mc.py" ;;
 esac
 

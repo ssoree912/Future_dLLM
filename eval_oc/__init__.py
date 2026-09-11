@@ -5,6 +5,7 @@ different questions: lm-eval scores generation here, OpenCompass scores the
 multiple-choice suite the way Sparse-dLLM reports it. Neither imports the
 other, and neither imports a Sparse-dLLM checkout.
 """
+from .llada_model import LLaDAFutureOC
 from .model import DreamFutureOC
 
-__all__ = ["DreamFutureOC"]
+__all__ = ["DreamFutureOC", "LLaDAFutureOC"]
