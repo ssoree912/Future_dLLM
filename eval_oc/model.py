@@ -122,6 +122,18 @@ class DreamFutureOC(BaseModel):
             path, max_seq_len=max_seq_len, block_length=self._block_length,
             keep_ratio=self._keep_ratio)
         self.model.eval()
+        # load_model injects these onto the config before from_pretrained, and
+        # dream_generate reads them back off model.config rather than from its
+        # own arguments. Reading them back here turns "the config said 0.5"
+        # into "the model is running at 0.5", which is the claim the whole
+        # comparison rests on and is otherwise invisible in the logs.
+        if (self.model.config.keep_ratio != self._keep_ratio
+                or self.model.config.block_len != self._block_length):
+            raise RuntimeError(
+                f"eviction settings did not reach the model: config says "
+                f"keep_ratio={self.model.config.keep_ratio} "
+                f"block_len={self.model.config.block_len}, expected "
+                f"{self._keep_ratio} / {self._block_length}")
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         self.tokenizer.truncation_side = "left"
 
