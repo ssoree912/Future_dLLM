@@ -73,14 +73,16 @@ def main():
             print(f"       ref  {ref[0, :12].tolist()} ... {ref[0, -8:].tolist()}")
             print(f"       ours {ours[0, :12].tolist()} ... {ours[0, -8:].tolist()}")
 
-    # Truncation side is a documented deviation: assert it actually bites, so
-    # the long prompt keeps its question rather than its first few shots.
+    # Left truncation is OpenCompass's default (and so Sparse-dLLM's, inherited),
+    # but this class sets it by hand because BaseModel loads no tokenizer. Assert
+    # it actually bites: right truncation would drop the real question off a long
+    # 5-shot prompt and keep the example shots instead.
     long_case = cases["mmlu 5-shot (long, hits truncation)"]
     tokenizer.truncation_side = "right"
     right = reference_encode(tokenizer, [long_case], MAX_SEQ_LEN)
     tokenizer.truncation_side = "left"
     left = reference_encode(tokenizer, [long_case], MAX_SEQ_LEN)
-    tail = "left-truncation keeps the final question"
+    tail = "left truncation keeps the final question"
     kept = tokenizer.decode(left[0, -40:])
     print(f"  {'OK  ' if 'holding' in kept else 'FAIL'} {tail:38s} "
           f"(right-truncated tail: {tokenizer.decode(right[0, -12:])!r})")

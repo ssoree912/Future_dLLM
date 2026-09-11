@@ -25,13 +25,17 @@ That verification is what lets this wrapper stand in for theirs.
 
 Prompt handling mirrors ``Sparse_dLLM_DreamCausalLMInstruct.generate`` step for
 step, because on an instruct model scored generatively the template decides the
-score as much as the cache policy does. Two deliberate deviations, both applied
-to every row so the comparison stays internally valid:
+score as much as the cache policy does. One deliberate deviation, applied to
+every row so the comparison stays internally valid: per-prompt seeding instead
+of one global seed, so a rerun or a resumed shard reproduces the same answer.
 
-* ``truncation_side="left"``. They leave the Qwen2 default (right), which drops
-  the actual question off the end of a long 5-shot prompt.
-* per-prompt seeding instead of one global seed, so a rerun or a resumed shard
-  reproduces the same answer.
+``truncation_side="left"`` is not a deviation. It is what OpenCompass itself
+sets in ``HuggingFaceBaseModel._load_tokenizer`` (``DEFAULT_TOKENIZER_KWARGS``,
+alongside ``padding_side='left'``), and Sparse-dLLM's wrapper subclasses that
+model and calls the inherited loader, so it gets the same. It is set explicitly
+here only because this class derives from ``BaseModel``, which loads no
+tokenizer of its own. The ``truncation_side='right'`` elsewhere in that file
+belongs to ``get_ppl_tokenwise``, a scoring path this suite does not use.
 
 One difference that is not a deviation: they narrow ``steps`` by mutating
 ``self.diffusion_config`` in place, which leaks the smaller value into later
@@ -135,7 +139,7 @@ class DreamFutureOC(BaseModel):
                 f"block_len={self.model.config.block_len}, expected "
                 f"{self._keep_ratio} / {self._block_length}")
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-        self.tokenizer.truncation_side = "left"
+        self.tokenizer.truncation_side = "left"   # OpenCompass's own default
 
         self._scorer = None
         if self._eviction_method == "student":
