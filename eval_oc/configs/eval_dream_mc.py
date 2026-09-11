@@ -28,10 +28,12 @@ and total where it does occur. Temperature 0.2 is also what the teacher labels
 and the trained scorer were built under, so changing it costs a re-extraction.
 
 Datasets are imported from the installed OpenCompass package, untouched. The
-one exception is GPQA: their 5-shot direct-answer config has no equivalent in
-vanilla OpenCompass (which ships 0-shot CoT variants), so it is vendored under
-``eval_oc/datasets/`` with attribution instead of being patched into the
-OpenCompass tree.
+two exceptions live under ``eval_oc/datasets/`` instead, with attribution,
+rather than being patched into the OpenCompass tree. GPQA: their 5-shot
+direct-answer config has no equivalent in vanilla OpenCompass, which ships
+0-shot CoT variants. ARC-C: the stock ``ARC_c_gen`` evaluates the 299-question
+dev split, and the number papers report is the 1172-question test split, so the
+vendored copy changes the path and nothing else.
 
 MMLU is not here. At ~9 s/item it is 14042 x 3 rows = 42k generations, four
 fifths of the whole suite's cost on its own, so it gets its own config
@@ -55,9 +57,9 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLEvalTask, OpenICLInferTask
 
 with read_base():
-    from opencompass.configs.datasets.ARC_c.ARC_c_gen import ARC_c_datasets
     from opencompass.configs.datasets.piqa.piqa_gen import piqa_datasets
 
+    from ..datasets.ARC_c.ARC_c_test_gen import ARC_c_datasets
     from ..datasets.gpqa.gpqa_gen_5shot import gpqa_datasets
 
 datasets = [*gpqa_datasets, *ARC_c_datasets, *piqa_datasets]
