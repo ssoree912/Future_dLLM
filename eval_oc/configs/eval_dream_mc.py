@@ -19,8 +19,11 @@ vanilla OpenCompass (which ships 0-shot CoT variants), so it is vendored under
 ``eval_oc/datasets/`` with attribution instead of being patched into the
 OpenCompass tree.
 
-Ordered cheapest first -- GPQA 198, ARC-C 1172, PIQA 1838, MMLU 14042 -- so a
-configuration error surfaces in minutes, not after a day of MMLU.
+MMLU is not here. At ~9 s/item it is 14042 x 3 rows = 42k generations, four
+fifths of the whole suite's cost on its own, so it gets its own config
+(``eval_dream_mmlu.py``) that can be scheduled independently. What is left is
+ordered cheapest first -- GPQA 198, ARC-C 1172, PIQA 1838 -- so a configuration
+error surfaces in minutes.
 
     scripts/run_oc_mc.sh
 
@@ -39,12 +42,11 @@ from opencompass.tasks import OpenICLEvalTask, OpenICLInferTask
 
 with read_base():
     from opencompass.configs.datasets.ARC_c.ARC_c_gen import ARC_c_datasets
-    from opencompass.configs.datasets.mmlu.mmlu_gen_79e572 import mmlu_datasets
     from opencompass.configs.datasets.piqa.piqa_gen import piqa_datasets
 
     from ..datasets.gpqa.gpqa_gen_5shot import gpqa_datasets
 
-datasets = [*gpqa_datasets, *ARC_c_datasets, *piqa_datasets, *mmlu_datasets]
+datasets = [*gpqa_datasets, *ARC_c_datasets, *piqa_datasets]
 
 max_seq_len = 2048
 max_out_len = 256

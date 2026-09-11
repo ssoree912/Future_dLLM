@@ -7,7 +7,8 @@
 # reports them. Same model, same decoding, different harness.
 #
 #   scripts/run_oc_mc.sh smoke     # 2 items per dataset, student row only
-#   scripts/run_oc_mc.sh           # the full suite, all three rows
+#   scripts/run_oc_mc.sh           # GPQA + ARC-C + PIQA, all three rows
+#   scripts/run_oc_mc.sh mmlu      # MMLU alone -- four fifths of the cost
 #
 # Env: FUTURE_DLLM_MODEL, FUTURE_DLLM_STUDENT, CUDA_VISIBLE_DEVICES.
 set -euo pipefail
@@ -27,12 +28,11 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 # in its own subprocess, so the repo has to be importable from the environment.
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
-if [[ "${1:-}" == "smoke" ]]; then
-  CONFIG="eval_oc/configs/eval_dream_mc_smoke.py"
-  shift
-else
-  CONFIG="eval_oc/configs/eval_dream_mc.py"
-fi
+case "${1:-}" in
+  smoke) CONFIG="eval_oc/configs/eval_dream_mc_smoke.py"; shift ;;
+  mmlu)  CONFIG="eval_oc/configs/eval_dream_mmlu.py";     shift ;;
+  *)     CONFIG="eval_oc/configs/eval_dream_mc.py" ;;
+esac
 
 mkdir -p logs/oc
 LOG="logs/oc/$(basename "${CONFIG%.py}")_$(date +%Y%m%d_%H%M%S).log"
