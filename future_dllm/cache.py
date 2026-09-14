@@ -132,6 +132,10 @@ class CustomCache:
         # Teacher collection.
         self.collect_pool = False
         self.capture_rows = False
+        # Head-averaging the rows is what forces every head in a layer to share
+        # one kept set. Keeping the axis is the only change the label needs for
+        # per-head eviction; it costs H times the storage, so it is opt-in.
+        self.capture_per_head = False
         self.pending_rows = {}
         self.row_mask = None
 
@@ -157,11 +161,13 @@ class CustomCache:
         scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / (q.size(-1) ** 0.5)
         weights = torch.softmax(scores, dim=-1)
         n_cand = k.size(-2) - q.size(-2)
-        rows = weights[..., :n_cand].mean(dim=1).squeeze(0)
+        rows = weights[..., :n_cand]
+        rows = (rows.squeeze(0) if self.capture_per_head
+                else rows.mean(dim=1).squeeze(0))
         if layer_id in self.candidate_order:
             # Decode in score order, but keep teacher columns in natural order.
             natural_rows = torch.empty_like(rows)
-            natural_rows[:, self.candidate_order[layer_id]] = rows
+            natural_rows[..., self.candidate_order[layer_id]] = rows
             rows = natural_rows
         self.pending_rows[layer_id] = rows
 

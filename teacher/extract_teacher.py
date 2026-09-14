@@ -66,6 +66,12 @@ def parse_args(family, description):
     p.add_argument("--max-prompt-len", type=int, default=None,
                    help="optional stricter prompt-only cap")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--per-head", action="store_true",
+                   help="label every attention head separately instead of "
+                        "averaging them. Needed for per-head eviction, where "
+                        "each head keeps its own top-k; costs H times the "
+                        "storage, so it writes its own teacher_kind and is "
+                        "meant for a separate --output-root")
     from future_dllm.dream_decoding import add_dream_arguments
     add_dream_arguments(p)
     p.add_argument(
@@ -174,17 +180,22 @@ def collect(model, prompt_ids, args, backend):
 
         # One more forward on the completed block: all rows are real tokens now.
         cache.capture_rows = True
+        cache.capture_per_head = bool(getattr(args, "per_head", False))
         step(S - 1)
         save_attention_rows = getattr(args, "save_attention_rows", False)
+        # Per head the rows arrive as [heads, block rows, candidates], so the
+        # max that turns rows into a label moves one axis right and the result
+        # keeps its head axis: [layers, heads, candidates].
+        row_axis = 1 if cache.capture_per_head else 0
         if save_attention_rows:
             future_attention_rows = torch.stack(
                 [cache.pending_rows[l].clone() for l in range(L)]
             )
-            label = future_attention_rows.max(dim=1).values
+            label = future_attention_rows.max(dim=row_axis + 1).values
         else:
             # Keep the ordinary teacher path at its original memory footprint.
             label = torch.stack([
-                cache.pending_rows[layer].max(dim=0).values
+                cache.pending_rows[layer].max(dim=row_axis).values
                 for layer in range(L)
             ])
         cache.pending_rows.clear()
@@ -343,7 +354,9 @@ def run(family, description):
                    "prompt_limit": args.prompt_limit,
                    "gen_length": args.gen_length,
                    "max_seq_len": args.max_seq_len,
-                   "teacher_kind": "final_rowmax",
+                   "teacher_kind": ("final_rowmax_per_head"
+                                    if getattr(args, "per_head", False)
+                                    else "final_rowmax"),
                    "attention_rows_saved": args.save_attention_rows,
                    "blocks": records}
         if decoding is not None:
