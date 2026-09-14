@@ -17,6 +17,12 @@ class StudentConfig:
     proj_dim: int = 256
     mlp_dim: int = 512
     heads: tuple[str, ...] = ("score",)
+    # Attention heads scored separately. 1 is the head-averaged scorer this repo
+    # shipped: one score per position, one kept set per layer. Larger means the
+    # readout emits one score per attention head, so each head can keep its own
+    # top-k. Only the readout widens -- the projections stay shared, which is
+    # what keeps the checkpoint the same size to within a couple of MB.
+    attn_heads: int = 1
 
 
 def _normalize_heads(heads: tuple[str, ...] | list[str] | str) -> tuple[str, ...]:
@@ -35,7 +41,7 @@ def _build_score_head(config: StudentConfig) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(width, config.mlp_dim),
         nn.GELU(),
-        nn.Linear(config.mlp_dim, 1),
+        nn.Linear(config.mlp_dim, config.attn_heads),
     )
 
 
@@ -43,6 +49,7 @@ class PromptUtilityStudentLayer(nn.Module):
     def __init__(self, config: StudentConfig) -> None:
         super().__init__()
         self.heads = _normalize_heads(config.heads)
+        self.attn_heads = int(config.attn_heads)
         self.token_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         self.block_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         if self.heads == ("score",):
@@ -79,7 +86,12 @@ class PromptUtilityStudentLayer(nn.Module):
             -1, token_proj.shape[1], -1
         )
         fused = torch.cat([token_proj, block_proj, token_proj * block_proj], dim=-1)
-        return self._head(head)(fused).squeeze(-1)
+        scores = self._head(head)(fused)
+        if self.attn_heads == 1:
+            return scores.squeeze(-1)                  # [batch, candidates]
+        # [batch, attn heads, candidates]: heads first, so a top-k over the last
+        # axis gives each head its own kept set.
+        return scores.transpose(-2, -1)
 
 
 class PromptUtilityStudent(nn.Module):
@@ -92,6 +104,7 @@ class PromptUtilityStudent(nn.Module):
             proj_dim=config.proj_dim,
             mlp_dim=config.mlp_dim,
             heads=heads,
+            attn_heads=config.attn_heads,
         )
         self.layer_indices = tuple(range(self.config.layer_count))
         self.layers = nn.ModuleDict(

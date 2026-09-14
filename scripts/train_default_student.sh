@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # Train the default student, using every natural teacher block.
+#
+# TEACHER_ROOT / MAX_SHARDS / RUN_NAME are overridable, so the per-head labels
+# train from here too. The scorer's width is read off the labels themselves, so
+# nothing else has to be told which kind they are:
+#
+#   TEACHER_ROOT=$PWD/artifacts/teacher_perhead MAX_SHARDS="250,185,75,50,250" \
+#     scripts/train_default_student.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,7 +22,8 @@ MLP_DIM="${MLP_DIM:-512}"
 PAIRS="${PAIRS:-4096}"
 MAX_SEQ_LEN=4096
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-default_5ds_500-371-150-100-500_e${EPOCHS}_lr${LR}_${RUN_TAG}}"
+MAX_SHARDS="${MAX_SHARDS:-500,371,150,100,500}"
+RUN_NAME="${RUN_NAME:-default_5ds_$(echo "$MAX_SHARDS" | tr , -)_e${EPOCHS}_lr${LR}_${RUN_TAG}}"
 LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
@@ -40,7 +48,7 @@ printf 'default student training\nmodel=%s\nteacher=%s\nmax_seq_len=%s\nrun=%s\n
 "$PY" "$REPO/student/train_student.py" \
   --model "$MODEL" \
   --teacher-root "$TEACHER_ROOTS" \
-  --max-shards "500,371,150,100,500" \
+  --max-shards "$MAX_SHARDS" \
   --epochs "$EPOCHS" \
   --lr "$LR" \
   --seed "$SEED" \

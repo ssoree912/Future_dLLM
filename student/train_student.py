@@ -67,17 +67,29 @@ def parse_args():
                         "N prompts of each domain, 0 = all. The cut is taken before "
                         "the val split, "
                         "so val stays the same fraction of what is used.")
+    p.add_argument("--resume", action="store_true",
+                   help="resume from the latest checkpoint-epoch-* under the output directory")
     return p.parse_args()
 
 
 def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
+    """Mean top-k agreement over the grid, averaged over attention heads.
+
+    Takes [candidates] or [heads, candidates]. Per head there are 32 layers x 32
+    heads of these per record, so the set arithmetic this used to do in Python
+    is done on the device instead.
+    """
+    p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+    t = target if target.dim() == 2 else target.unsqueeze(0)
+    n = t.shape[-1]
     out = []
     for r in ratios:
-        k = max(1, int(target.numel() * r))
-        a = set(torch.topk(pred, k).indices.tolist())
-        b = set(torch.topk(target, k).indices.tolist())
-        out.append(len(a & b) / k)
-    return sum(out) / len(out)
+        k = max(1, int(n * r))
+        chosen = p.topk(k, dim=-1).indices
+        mark = torch.zeros_like(t, dtype=torch.bool)
+        mark.scatter_(-1, t.topk(k, dim=-1).indices, True)
+        out.append(mark.gather(-1, chosen).sum(-1).float().mean() / k)
+    return float(sum(out) / len(out))
 
 
 def checkpoint_name(datasets, counts, epochs, lr):
@@ -197,10 +209,19 @@ def main():
         (args.name or checkpoint_name(datasets, counts, args.epochs, args.lr)))
     print(f"checkpoint -> {out_dir}", flush=True)
 
+    # Per-head labels carry an extra axis, [layers, heads, candidates], and the
+    # readout has to be as wide as that axis. Read it off the data rather than
+    # taking it as a flag: a mismatch here trains silently against the wrong
+    # target instead of failing.
+    probe = load_shard(train_shards[0][1])["blocks"][0]["label_final_rowmax"]
+    attn_heads = int(probe.shape[1]) if probe.dim() == 3 else 1
+    print(f"teacher labels: {tuple(probe.shape)} -> attn_heads={attn_heads}", flush=True)
+
     # Same class the deployment path loads, so the checkpoint drops straight in.
     from future_dllm import PromptUtilityStudent, StudentConfig
     student_cfg = StudentConfig(layer_count=L, hidden_dim=H, proj_dim=args.proj_dim,
-                                mlp_dim=args.mlp_dim, heads=("score",))
+                                mlp_dim=args.mlp_dim, heads=("score",),
+                                attn_heads=attn_heads)
     student = PromptUtilityStudent(student_cfg).to(device).float()
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -210,12 +231,40 @@ def main():
                "block_length": args.block_length,
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
+               "attn_heads": attn_heads,
                "val_ratio": args.val_ratio, "pairs": args.pairs,
                "max_seq_len": args.max_seq_len,
                "lambda_list": args.lambda_list,
                "teacher_roots": roots,
                "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
               open(out_dir / "meta.json", "w"), indent=2)
+
+    start_epoch = 0
+    best = -1.0
+    if args.resume:
+        epoch_dirs = []
+        for path in out_dir.glob("checkpoint-epoch-*"):
+            try:
+                epoch_dirs.append((int(path.name.rsplit("-", 1)[-1]), path))
+            except ValueError:
+                continue
+        if not epoch_dirs:
+            raise SystemExit(f"--resume requested but no epoch checkpoints under {out_dir}")
+        last_epoch, last_dir = max(epoch_dirs)
+        weights = last_dir / "pytorch_model.bin"
+        optimizer = last_dir / "optimizer.pt"
+        state = last_dir / "trainer_state.json"
+        student.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
+        opt.load_state_dict(torch.load(optimizer, map_location=device, weights_only=True))
+        saved_state = json.loads(state.read_text())
+        start_epoch = int(saved_state["epoch"]) + 1
+        best_path = out_dir / "best.json"
+        if best_path.exists():
+            best = float(json.loads(best_path.read_text()).get("val_recall", -1.0))
+        if start_epoch >= args.epochs:
+            print(f"resume checkpoint is already at epoch {start_epoch}; requested epochs={args.epochs}", flush=True)
+            return 0
+        print(f"resuming from {last_dir} at epoch {start_epoch}", flush=True)
 
     @torch.no_grad()
     def features(record):
@@ -246,31 +295,44 @@ def main():
             pred = student.forward_layer(l, h, cand, head="score",
                                          block_indices=blk).squeeze(0)
             tgt = label[l]
-            if not torch.isfinite(tgt).all() or tgt.sum() <= 0:
+            # One head-averaged row or one row per attention head: the last axis
+            # is candidates either way, so the terms below are written against
+            # [rows, candidates] and the head-averaged case is simply one row.
+            rows_t = tgt if tgt.dim() == 2 else tgt.unsqueeze(0)
+            rows_p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+            mass = rows_t.sum(-1)
+            usable = torch.isfinite(rows_t).all(-1) & (mass > 0)
+            if not bool(usable.any()):
                 continue
+            rows_t, rows_p = rows_t[usable], rows_p[usable]
             # listwise: KL against the normalised label distribution. reduction has to
             # be "sum" — pred is 1-D, so "batchmean" would divide the KL by the
             # candidate count and shrink the term by 132x (mmlu) to 2528x
             # (gov_report), silently weighting domains by their prompt length.
+            # Summing over heads as well keeps each head's term the size it
+            # would have been on its own.
             loss = args.lambda_list * F.kl_div(
-                F.log_softmax(pred, -1), tgt / tgt.sum(), reduction="sum")
-            # pairwise: random pairs anywhere in the range, to fix the ordering
-            i = torch.randint(0, tgt.numel(), (args.pairs,), device=device)
-            j = torch.randint(0, tgt.numel(), (args.pairs,), device=device)
-            sign = torch.sign(tgt[i] - tgt[j])
+                F.log_softmax(rows_p, -1),
+                rows_t / rows_t.sum(-1, keepdim=True), reduction="sum")
+            # pairwise: random pairs anywhere in the range, to fix the ordering.
+            # The same pair indices go to every head; the labels differ per head,
+            # so the constraint each head gets is its own.
+            i = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            j = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            sign = torch.sign(rows_t[..., i] - rows_t[..., j])
             keep = sign != 0
             if keep.any():
-                loss = loss + F.softplus(-sign[keep] * (pred[i][keep] - pred[j][keep])).mean()
+                diff = rows_p[..., i] - rows_p[..., j]
+                loss = loss + F.softplus(-sign[keep] * diff[keep]).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
             total += float(loss.detach())
-            recalls.append(recall_grid(pred.detach(), tgt))
+            recalls.append(recall_grid(rows_p.detach(), rows_t))
         return total / max(1, L), sum(recalls) / max(1, len(recalls))
 
-    best = -1.0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         student.train(); random.shuffle(train_shards)
         started, losses = time.time(), []
         for n, (_, path) in enumerate(train_shards):
@@ -291,6 +353,25 @@ def main():
         print(f"epoch {epoch}: loss {sum(losses)/len(losses):.4f} | "
               f"val recall macro {score:.4f} [{detail}] | "
               f"{(time.time()-started)/60:.1f}min", flush=True)
+        # Keep an independently loadable checkpoint for every completed epoch.
+        # The optimizer state and epoch number make --resume deterministic after
+        # an interruption; checkpoint-best remains the deployment convenience.
+        epoch_dir = out_dir / f"checkpoint-epoch-{epoch:02d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({k: v.cpu() for k, v in student.state_dict().items()},
+                   epoch_dir / "pytorch_model.bin")
+        torch.save(opt.state_dict(), epoch_dir / "optimizer.pt")
+        if decoding is not None:
+            with open(epoch_dir / "decoding.json", "w") as fh:
+                json.dump(decoding, fh, indent=2)
+        json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
+                   "mlp_dim": args.mlp_dim, "heads": ["score"],
+                   "attn_heads": attn_heads},
+                  open(epoch_dir / "config.json", "w"))
+        json.dump({"epoch": epoch, "val_recall": score,
+                   "val_recall_per_dataset": means},
+                  open(epoch_dir / "trainer_state.json", "w"), indent=2)
+        print(f"  saved epoch checkpoint -> {epoch_dir}", flush=True)
         if score > best:
             best = score
             ckpt = out_dir / "checkpoint-best"
@@ -301,7 +382,8 @@ def main():
             torch.save({k: v.cpu() for k, v in student.state_dict().items()},
                        ckpt / "pytorch_model.bin")
             json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
-                       "mlp_dim": args.mlp_dim, "heads": ["score"]},
+                       "mlp_dim": args.mlp_dim, "heads": ["score"],
+                       "attn_heads": attn_heads},
                       open(ckpt / "config.json", "w"))
             json.dump({"blk": student.block_proj_norms()},
                       open(out_dir / "block_proj_norms.json", "w"), indent=2)

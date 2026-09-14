@@ -248,6 +248,13 @@ class CustomCache:
         scores = self.cache_scorer.forward_layer(
             layer_id, hidden_states.float(), candidate_indices,
             head="score", block_indices=block_indices).float()
+        # [1, candidates] keeps one set for the whole layer; [1, heads,
+        # candidates] gives each head its own top-k over the same budget, so the
+        # cache is the same size and only its rows differ per head.
+        if scores.dim() == 3 and scores.shape[1] != keep_k.size(1):
+            raise RuntimeError(
+                f"scorer emits {scores.shape[1]} head scores but the cache has "
+                f"{keep_k.size(1)} heads")
         if self.accum_state is not None:
             # H2O's time axis, mapped onto blocks. The student is trained with a
             # listwise KL against the normalised label distribution, so its raw
@@ -258,12 +265,15 @@ class CustomCache:
             # block happened to have the widest spread decide the whole run.
             prior = self.accum_state.get(layer_id)
             if prior is None:
-                prior = torch.zeros(sequence_length, device=scores.device,
-                                    dtype=scores.dtype)
+                # One running row per scored head, so a per-head scorer keeps a
+                # per-head history rather than one shared one.
+                prior = torch.zeros((*scores.shape[1:-1], sequence_length),
+                                    device=scores.device, dtype=scores.dtype)
             prior = prior * self.accum_decay
-            prior = prior.index_add(0, candidate_indices, scores.softmax(-1).squeeze(0))
+            prior = prior.index_add(-1, candidate_indices,
+                                    scores.softmax(-1).squeeze(0))
             self.accum_state[layer_id] = prior
-            scores = prior.index_select(0, candidate_indices).unsqueeze(0)
+            scores = prior.index_select(-1, candidate_indices).unsqueeze(0)
 
         keep_num = int(candidate_indices.numel() * self.keep_ratios[layer_id])
         keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
@@ -271,13 +281,16 @@ class CustomCache:
             keep_indices = keep_indices.sort().values
 
         if self.keep_log:
-            kept = candidate_indices[keep_indices]
+            # Per head this counts every head's picks together, so the totals
+            # are heads x budget and the shares stay comparable.
+            kept = candidate_indices[keep_indices].reshape(-1)
             P, bs = int(self.prompt_length), int(cur_filtered_len)
             hist = torch.histc(kept.float(), bins=10, min=0,
                                max=float(sequence_length)).to(torch.long)
             with open(self.keep_log, "a") as fh:
                 fh.write(json.dumps({
                     "layer": layer_id, "block_start": bs, "prompt_len": P,
+                    "heads": int(keep_indices.shape[0]) if keep_indices.dim() > 1 else 1,
                     "seq_len": sequence_length, "kept": int(kept.numel()),
                     "n_prompt": int((kept < min(P, bs)).sum()),
                     "n_confirmed": int(((kept >= min(P, bs)) & (kept < bs)).sum()),
