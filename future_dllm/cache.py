@@ -268,6 +268,16 @@ class CustomCache:
         scores = self.cache_scorer.forward_layer(
             layer_id, hidden_states.float(), candidate_indices,
             head="score", block_indices=block_indices).float()
+        # A per-head scorer returns [1, kv heads, candidates] and every head
+        # then picks its own kept set; a head-averaged one returns [1,
+        # candidates] and one set is shared. The head axis has to be the cache's
+        # own, or the gather below would silently index the wrong entries.
+        per_head = scores.ndim == 3
+        if per_head and scores.shape[1] != keep_k.size(1):
+            raise RuntimeError(
+                f"scorer emits {scores.shape[1]} heads but the cache holds "
+                f"{keep_k.size(1)} KV heads at layer {layer_id}")
+        score_axis = 1 if per_head else 0
         if self.accum_state is not None:
             # H2O's time axis, mapped onto blocks. The student is trained with a
             # listwise KL against the normalised label distribution, so its raw
@@ -278,32 +288,46 @@ class CustomCache:
             # block happened to have the widest spread decide the whole run.
             prior = self.accum_state.get(layer_id)
             if prior is None:
-                prior = torch.zeros(sequence_length, device=scores.device,
-                                    dtype=scores.dtype)
+                # Per head the running score carries a row per head, so a head
+                # that wanted a position in an earlier block still remembers it
+                # when the others did not.
+                shape = ((scores.shape[1], sequence_length) if per_head
+                         else (sequence_length,))
+                prior = torch.zeros(shape, device=scores.device, dtype=scores.dtype)
             prior = prior * self.accum_decay
-            prior = prior.index_add(0, candidate_indices, scores.softmax(-1).squeeze(0))
+            prior = prior.index_add(score_axis, candidate_indices,
+                                    scores.softmax(-1).squeeze(0))
             self.accum_state[layer_id] = prior
-            scores = prior.index_select(0, candidate_indices).unsqueeze(0)
+            scores = prior.index_select(score_axis, candidate_indices).unsqueeze(0)
 
         keep_num = int(candidate_indices.numel() * self.keep_ratios[layer_id])
+        # [k] head-averaged, [kv heads, k] per head. keep_num is the budget of
+        # one head either way, so per-head eviction keeps the same total.
         keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
         if not self.baseline_order:
-            keep_indices = keep_indices.sort().values
+            keep_indices = keep_indices.sort(dim=-1).values
 
         if self.keep_log:
-            kept = candidate_indices[keep_indices]
+            kept_rows = candidate_indices[keep_indices]
+            # One line per head: a histogram over the heads pooled together
+            # would average away exactly the difference the head axis exists to
+            # record. Head-averaged runs keep their single line, head=null.
+            rows = ([(h, kept_rows[h]) for h in range(kept_rows.shape[0])]
+                    if per_head else [(None, kept_rows)])
             P, bs = int(self.prompt_length), int(cur_filtered_len)
-            hist = torch.histc(kept.float(), bins=10, min=0,
-                               max=float(sequence_length)).to(torch.long)
             with open(self.keep_log, "a") as fh:
-                fh.write(json.dumps({
-                    "layer": layer_id, "block_start": bs, "prompt_len": P,
-                    "seq_len": sequence_length, "kept": int(kept.numel()),
-                    "n_prompt": int((kept < min(P, bs)).sum()),
-                    "n_confirmed": int(((kept >= min(P, bs)) & (kept < bs)).sum()),
-                    "n_suffix": int((kept >= bs + block_len).sum()),
-                    "decile_hist": hist.tolist(),
-                }) + "\n")
+                for head_id, kept in rows:
+                    hist = torch.histc(kept.float(), bins=10, min=0,
+                                       max=float(sequence_length)).to(torch.long)
+                    fh.write(json.dumps({
+                        "layer": layer_id, "head": head_id, "block_start": bs,
+                        "prompt_len": P,
+                        "seq_len": sequence_length, "kept": int(kept.numel()),
+                        "n_prompt": int((kept < min(P, bs)).sum()),
+                        "n_confirmed": int(((kept >= min(P, bs)) & (kept < bs)).sum()),
+                        "n_suffix": int((kept >= bs + block_len).sum()),
+                        "decile_hist": hist.tolist(),
+                    }) + "\n")
 
         head_index = torch.arange(keep_k.size(1), device=keep_k.device)[:, None]
         self.cache[layer_id] = {"k": keep_k[:, head_index, keep_indices],

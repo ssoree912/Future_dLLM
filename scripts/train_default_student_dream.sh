@@ -27,7 +27,12 @@ MLP_DIM="${MLP_DIM:-512}"
 PAIRS="${PAIRS:-4096}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="${RUN_NAME:-dream_${DREAM_DECODER_TAG}_5ds_500-371-150-100-500_e${EPOCHS}_lr${LR}_len${MAX_SEQ_LEN}_${RUN_TAG}}"
+# Empty means "use every shard in the root". A teacher root built at a reduced
+# sample count already holds exactly what should be trained on, and the trainer
+# refuses a cap larger than what exists, so the cap has to be droppable.
+MAX_SHARDS="${MAX_SHARDS-500,371,150,100,500}"
+SAMPLE_TAG="${SAMPLE_TAG:-${MAX_SHARDS//,/-}}"
+RUN_NAME="${RUN_NAME:-dream_${DREAM_DECODER_TAG}_5ds${SAMPLE_TAG:+_$SAMPLE_TAG}_e${EPOCHS}_lr${LR}_len${MAX_SEQ_LEN}_${RUN_TAG}}"
 LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
@@ -46,13 +51,17 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-printf 'default student training (dream)\nmodel=%s\nteacher=%s\nmax_seq_len=%s\ngpu=%s\nrun=%s\nlog=%s\n' \
-  "$MODEL" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "$CUDA_VISIBLE_DEVICES" "$RUN_NAME" "$LOG_FILE"
+MAX_SHARDS_ARGS=()
+[ -n "$MAX_SHARDS" ] && MAX_SHARDS_ARGS=(--max-shards "$MAX_SHARDS")
+
+printf 'default student training (dream)\nmodel=%s\nteacher=%s\nmax_seq_len=%s\nmax_shards=%s\ngpu=%s\nrun=%s\nlog=%s\n' \
+  "$MODEL" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "${MAX_SHARDS:-all}" \
+  "$CUDA_VISIBLE_DEVICES" "$RUN_NAME" "$LOG_FILE"
 
 "$PY" "$REPO/student/train_student.py" \
   --model "$MODEL" \
   --teacher-root "$TEACHER_ROOTS" \
-  --max-shards "500,371,150,100,500" \
+  "${MAX_SHARDS_ARGS[@]}" \
   --epochs "$EPOCHS" \
   --lr "$LR" \
   --seed "$SEED" \

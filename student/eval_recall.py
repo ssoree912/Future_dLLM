@@ -11,14 +11,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
-    out = []
-    for r in ratios:
-        k = max(1, int(target.numel() * r))
-        a = set(torch.topk(pred, k).indices.tolist())
-        b = set(torch.topk(target, k).indices.tolist())
-        out.append(len(a & b) / k)
-    return sum(out) / len(out)
+# recall_grid lives in train_student and is imported in main(), once the paths
+# are set up. The copy that used to sit here drifted the moment the label grew a
+# head axis: it sized k off target.numel(), which for a [heads, candidates]
+# label is heads times too large.
 
 
 def main():
@@ -39,6 +35,7 @@ def main():
     random.seed(0)
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from train_student import recall_grid
     from future_dllm import CustomCache, load_model
     from future_dllm import load_prompt_utility_student
     from train_student import window_length, window_start
@@ -75,14 +72,18 @@ def main():
                 C = label.size(-1)
                 for l in range(L):
                     tgt = label[l]
-                    if not torch.isfinite(tgt).all() or tgt.sum() <= 0:
+                    if not torch.isfinite(tgt).all() or (tgt.sum(-1) <= 0).any():
                         continue
                     pred = student.forward_layer(l, hidden[l].float(), cand,
                                                  head="score",
                                                  block_indices=blk).squeeze(0)
                     stu.append(recall_grid(pred, tgt))
-                    rnd.append(recall_grid(torch.randn(C, device=device), tgt))
-                    rec.append(recall_grid(torch.arange(C, device=device).float(), tgt))
+                    # The baselines are scored against the same label, so they
+                    # carry its head axis too -- recency is the same ranking in
+                    # every head, random is an independent draw per head.
+                    rnd.append(recall_grid(torch.randn(tgt.shape, device=device), tgt))
+                    rec.append(recall_grid(
+                        torch.arange(C, device=device).float().expand(tgt.shape), tgt))
                 n += 1
         m = lambda v: sum(v) / max(1, len(v))
         print(f"{ds:10s} {n:7d} {m(stu):8.3f} {m(rnd):8.3f} {m(rec):8.3f}", flush=True)

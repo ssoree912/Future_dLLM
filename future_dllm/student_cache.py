@@ -17,6 +17,11 @@ class StudentConfig:
     proj_dim: int = 256
     mlp_dim: int = 512
     heads: tuple[str, ...] = ("score",)
+    # Attention KV heads the scorer emits one row per, matching the teacher
+    # label's head axis. 1 is the head-averaged student this repo shipped: one
+    # score per candidate, one kept set shared by every head. Distinct from
+    # ``heads`` above, which names *task* heads ("score"), not attention ones.
+    kv_heads: int = 1
 
 
 def _normalize_heads(heads: tuple[str, ...] | list[str] | str) -> tuple[str, ...]:
@@ -32,10 +37,17 @@ def _normalize_heads(heads: tuple[str, ...] | list[str] | str) -> tuple[str, ...
 def _build_score_head(config: StudentConfig) -> nn.Sequential:
     # [candidate ; current-block ; candidate * current-block]
     width = config.proj_dim * 3
+    # The trunk stays shared and only the readout widens: the features a
+    # candidate is scored from are the same whichever KV head reads it, so what
+    # differs per head is how those features are weighed, which is exactly a
+    # linear readout. kv_heads=1 reproduces the original [mlp_dim, 1] weight, so
+    # checkpoints written before this existed still load.
+    if config.kv_heads < 1:
+        raise RuntimeError(f"invalid student kv_heads: {config.kv_heads}")
     return nn.Sequential(
         nn.Linear(width, config.mlp_dim),
         nn.GELU(),
-        nn.Linear(config.mlp_dim, 1),
+        nn.Linear(config.mlp_dim, config.kv_heads),
     )
 
 
@@ -43,6 +55,7 @@ class PromptUtilityStudentLayer(nn.Module):
     def __init__(self, config: StudentConfig) -> None:
         super().__init__()
         self.heads = _normalize_heads(config.heads)
+        self.kv_heads = int(config.kv_heads)
         self.token_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         self.block_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         if self.heads == ("score",):
@@ -79,7 +92,10 @@ class PromptUtilityStudentLayer(nn.Module):
             -1, token_proj.shape[1], -1
         )
         fused = torch.cat([token_proj, block_proj, token_proj * block_proj], dim=-1)
-        return self._head(head)(fused).squeeze(-1)
+        scores = self._head(head)(fused)
+        if self.kv_heads == 1:
+            return scores.squeeze(-1)                  # [batch, candidates]
+        return scores.transpose(1, 2)                  # [batch, kv heads, candidates]
 
 
 class PromptUtilityStudent(nn.Module):
@@ -92,6 +108,7 @@ class PromptUtilityStudent(nn.Module):
             proj_dim=config.proj_dim,
             mlp_dim=config.mlp_dim,
             heads=heads,
+            kv_heads=config.kv_heads,
         )
         self.layer_indices = tuple(range(self.config.layer_count))
         self.layers = nn.ModuleDict(

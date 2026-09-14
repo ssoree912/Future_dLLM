@@ -29,6 +29,10 @@ class Backend:
     mask_id: int
     n_layers: int
     hidden_dim: int
+    # KV heads, not query heads. The eviction cache stores K/V before repeat_kv,
+    # so this is the axis filter_cache indexes and the finest granularity a
+    # per-head kept set can be stated at. MHA backends report their head count.
+    kv_heads: int
     # Total sequence length the checkpoint was trained for, for the warning in
     # the extractor. LLaDA calls it max_sequence_length, Dream reuses the Qwen2
     # max_position_embeddings.
@@ -101,6 +105,7 @@ def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
             mask_id=int(cfg.mask_token_id),
             n_layers=int(cfg.num_hidden_layers),
             hidden_dim=int(cfg.hidden_size),
+            kv_heads=int(cfg.num_key_value_heads),
             native_max_seq_len=native,
             generate=dream_generate,
             logit_shift=True,
@@ -125,6 +130,7 @@ def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
         mask_id=126336,
         n_layers=int(cfg.n_layers),
         hidden_dim=int(cfg.d_model),
+        kv_heads=int(cfg.effective_n_kv_heads),
         native_max_seq_len=native,
         generate=llada_generate,
         logit_shift=False,

@@ -71,13 +71,37 @@ def parse_args():
 
 
 def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
+    """Mean overlap of the kept sets over a budget grid.
+
+    Both arguments are either ``[candidates]`` or, per head, ``[kv heads,
+    candidates]`` -- the budget is per head either way, so ``k`` comes off the
+    candidate axis and a per-head recall is averaged over the heads.
+    """
     out = []
     for r in ratios:
-        k = max(1, int(target.numel() * r))
-        a = set(torch.topk(pred, k).indices.tolist())
-        b = set(torch.topk(target, k).indices.tolist())
-        out.append(len(a & b) / k)
+        k = max(1, int(target.shape[-1] * r))
+        a = torch.topk(pred, k, dim=-1).indices
+        b = torch.topk(target, k, dim=-1).indices
+        if target.ndim == 1:
+            out.append(len(set(a.tolist()) & set(b.tolist())) / k)
+        else:
+            out.append(sum(len(set(x.tolist()) & set(y.tolist())) / k
+                           for x, y in zip(a, b)) / target.shape[0])
     return sum(out) / len(out)
+
+
+def head_agreement(pred, ratio=0.2):
+    """Mean pairwise overlap of the heads' kept sets, at one budget.
+
+    1.0 means every head ranked the candidates the same way and the head axis
+    bought nothing; the label's own figure is the thing to compare against.
+    """
+    if pred.ndim == 1 or pred.shape[0] < 2:
+        return None
+    k = max(1, int(pred.shape[-1] * ratio))
+    sets = [set(row.tolist()) for row in torch.topk(pred, k, dim=-1).indices]
+    pairs = [len(a & b) / k for i, a in enumerate(sets) for b in sets[i + 1:]]
+    return sum(pairs) / len(pairs)
 
 
 def checkpoint_name(datasets, counts, epochs, lr):
@@ -160,6 +184,7 @@ def main():
     if shard_caps and len(shard_caps) != len(roots):
         raise SystemExit("--max-shards needs one entry per teacher root")
     train_shards, val_shards, datasets = [], [], []
+    kinds, label_heads = set(), set()
     for index, root in enumerate(roots):
         name = Path(root).name
         found = sorted(glob.glob(f"{root}/*.pt"))
@@ -182,6 +207,8 @@ def main():
                 f"({head.get('model', 'unknown checkpoint')}), but --model is a "
                 f"{backend.name} checkpoint. Pass the model the labels came from."
             )
+        kinds.add(head.get("teacher_kind", "final_rowmax"))
+        label_heads.add(int(head.get("num_label_heads", 1)))
         split = max(1, int(len(found) * args.val_ratio))
         val_shards += [(name, p) for p in found[:split]]
         train_shards += [(name, p) for p in found[split:]]
@@ -190,6 +217,26 @@ def main():
               f"{'' if shard_backend is None else f' [{shard_backend}]'}", flush=True)
     print(f"train {len(train_shards)} / val {len(val_shards)} shards "
           f"over {len(datasets)} domain(s)", flush=True)
+
+    # A per-head root and a head-averaged one train different students, and
+    # mixing them would silently broadcast one label rank against the other, so
+    # the roots have to agree before anything is built.
+    if len(kinds) != 1 or len(label_heads) != 1:
+        raise SystemExit(f"teacher roots disagree on the label: kinds={sorted(kinds)} "
+                         f"heads={sorted(label_heads)}; train one kind at a time")
+    teacher_kind, K = sorted(kinds)[0], sorted(label_heads)[0]
+    per_head = teacher_kind.endswith("_per_head")
+    if per_head != (K > 1):
+        raise SystemExit(f"teacher_kind={teacher_kind} but num_label_heads={K}")
+    # The label's head axis is the cache's KV head axis, so a mismatch here means
+    # the scorer would emit a kept set the cache cannot be indexed with -- the one
+    # error in this path that still produces a loadable-looking checkpoint.
+    if per_head and K != backend.kv_heads:
+        raise SystemExit(
+            f"teacher labels carry {K} heads but {backend.name} has "
+            f"{backend.kv_heads} KV heads; these labels came from another model")
+    print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
+          f"{' (per KV head)' if per_head else ' (head-averaged)'}", flush=True)
 
     counts = [sum(1 for n, _ in train_shards + val_shards if n == d) for d in datasets]
     out_dir = Path(args.output_dir) if args.output_dir else (
@@ -200,7 +247,7 @@ def main():
     # Same class the deployment path loads, so the checkpoint drops straight in.
     from future_dllm import PromptUtilityStudent, StudentConfig
     student_cfg = StudentConfig(layer_count=L, hidden_dim=H, proj_dim=args.proj_dim,
-                                mlp_dim=args.mlp_dim, heads=("score",))
+                                mlp_dim=args.mlp_dim, heads=("score",), kv_heads=K)
     student = PromptUtilityStudent(student_cfg).to(device).float()
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +261,7 @@ def main():
                "max_seq_len": args.max_seq_len,
                "lambda_list": args.lambda_list,
                "teacher_roots": roots,
+               "teacher_kind": teacher_kind, "kv_heads": K,
                "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
               open(out_dir / "meta.json", "w"), indent=2)
 
@@ -240,34 +288,50 @@ def main():
         ws = window_start(record)
         blk = torch.arange(ws, ws + window_length(record), device=device)
         label = record["label_final_rowmax"].float().to(device)
-        total, recalls = 0.0, []
+        total, recalls, agreements, label_agreements = 0.0, [], [], []
         for l in range(L):
             h = hidden[l].float()
             pred = student.forward_layer(l, h, cand, head="score",
                                          block_indices=blk).squeeze(0)
             tgt = label[l]
-            if not torch.isfinite(tgt).all() or tgt.sum() <= 0:
+            if not torch.isfinite(tgt).all() or (tgt.sum(-1) <= 0).any():
                 continue
-            # listwise: KL against the normalised label distribution. reduction has to
-            # be "sum" — pred is 1-D, so "batchmean" would divide the KL by the
-            # candidate count and shrink the term by 132x (mmlu) to 2528x
-            # (gov_report), silently weighting domains by their prompt length.
-            loss = args.lambda_list * F.kl_div(
-                F.log_softmax(pred, -1), tgt / tgt.sum(), reduction="sum")
-            # pairwise: random pairs anywhere in the range, to fix the ordering
-            i = torch.randint(0, tgt.numel(), (args.pairs,), device=device)
-            j = torch.randint(0, tgt.numel(), (args.pairs,), device=device)
-            sign = torch.sign(tgt[i] - tgt[j])
+            # listwise: KL against the normalised label distribution. The sum is
+            # over candidates and must stay a sum — "batchmean" would divide the
+            # KL by the candidate count and shrink the term by 132x (mmlu) to
+            # 2528x (gov_report), silently weighting domains by their prompt
+            # length. Per head the heads are then *averaged*, not summed, so the
+            # term keeps the magnitude the head-averaged student was tuned at
+            # and --lr carries over unchanged.
+            kl = F.kl_div(F.log_softmax(pred, -1), tgt / tgt.sum(-1, keepdim=True),
+                          reduction="none").sum(-1)
+            loss = args.lambda_list * kl.mean()
+            # pairwise: random pairs anywhere in the range, to fix the ordering.
+            # The draw indexes the candidate axis, so every head is ranked
+            # against the same pairs and the mean spans heads and pairs alike.
+            C = tgt.shape[-1]
+            i = torch.randint(0, C, (args.pairs,), device=device)
+            j = torch.randint(0, C, (args.pairs,), device=device)
+            sign = torch.sign(tgt[..., i] - tgt[..., j])
             keep = sign != 0
             if keep.any():
-                loss = loss + F.softplus(-sign[keep] * (pred[i][keep] - pred[j][keep])).mean()
+                margin = pred[..., i] - pred[..., j]
+                loss = loss + F.softplus(-sign[keep] * margin[keep]).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
             total += float(loss.detach())
             recalls.append(recall_grid(pred.detach(), tgt))
-        return total / max(1, L), sum(recalls) / max(1, len(recalls))
+            # Whether the head axis is earning its 4x: the heads' own overlap,
+            # against the same figure for the label they are fit to.
+            agreement = head_agreement(pred.detach())
+            if agreement is not None:
+                agreements.append(agreement)
+                label_agreements.append(head_agreement(tgt))
+        return (total / max(1, L), sum(recalls) / max(1, len(recalls)),
+                sum(agreements) / len(agreements) if agreements else None,
+                sum(label_agreements) / len(label_agreements) if label_agreements else None)
 
     best = -1.0
     for epoch in range(args.epochs):
@@ -280,16 +344,23 @@ def main():
                 print(f"  epoch {epoch} {n+1}/{len(train_shards)} "
                       f"loss {sum(losses[-120:])/max(1,len(losses[-120:])):.4f}", flush=True)
         student.eval()
-        per_ds = {}
+        per_ds, agree, agree_label = {}, [], []
         with torch.no_grad():
             for name, p in val_shards:
                 for r in read_teacher(p)["blocks"]:
-                    per_ds.setdefault(name, []).append(step(r, False)[1])
+                    _, recall, a, al = step(r, False)
+                    per_ds.setdefault(name, []).append(recall)
+                    if a is not None:
+                        agree.append(a); agree_label.append(al)
         means = {k: sum(v) / max(1, len(v)) for k, v in per_ds.items()}
         score = sum(means.values()) / max(1, len(means))   # domain macro average
         detail = "  ".join(f"{k} {v:.3f}" for k, v in sorted(means.items()))
+        head_line = ""
+        if agree:
+            head_line = (f" | head overlap@0.2 pred {sum(agree)/len(agree):.3f} "
+                         f"label {sum(agree_label)/len(agree_label):.3f}")
         print(f"epoch {epoch}: loss {sum(losses)/len(losses):.4f} | "
-              f"val recall macro {score:.4f} [{detail}] | "
+              f"val recall macro {score:.4f} [{detail}]{head_line} | "
               f"{(time.time()-started)/60:.1f}min", flush=True)
         if score > best:
             best = score
@@ -301,12 +372,15 @@ def main():
             torch.save({k: v.cpu() for k, v in student.state_dict().items()},
                        ckpt / "pytorch_model.bin")
             json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
-                       "mlp_dim": args.mlp_dim, "heads": ["score"]},
+                       "mlp_dim": args.mlp_dim, "heads": ["score"], "kv_heads": K},
                       open(ckpt / "config.json", "w"))
             json.dump({"blk": student.block_proj_norms()},
                       open(out_dir / "block_proj_norms.json", "w"), indent=2)
             json.dump({"val_recall": score, "val_recall_per_dataset": means,
-                       "epoch": epoch, "datasets": datasets},
+                       "epoch": epoch, "datasets": datasets, "kv_heads": K,
+                       "head_overlap_pred": sum(agree)/len(agree) if agree else None,
+                       "head_overlap_label": (sum(agree_label)/len(agree_label)
+                                              if agree_label else None)},
                       open(out_dir / "best.json", "w"))
             print(f"  saved (best {best:.4f})", flush=True)
     print(f"done. best val recall {best:.4f} -> {out_dir}/checkpoint-best", flush=True)
