@@ -99,10 +99,17 @@ class CustomCache:
         current_score_pool_kernel: Optional[int] = 3,
         eviction_method: str = "student",
         baseline_order: bool = False,
+        accum_state: Optional[dict] = None,
+        accum_decay: float = 1.0,
     ) -> None:
         if eviction_method not in ("student", "sparse"):
             raise ValueError("eviction_method must be student or sparse")
         self.cache = {}
+        # Running per-layer score buffer shared across blocks, indexed by
+        # absolute sequence position. The caller owns it because a cache lives
+        # for one block; None keeps the per-block selection this repo shipped.
+        self.accum_state = accum_state
+        self.accum_decay = float(accum_decay)
         self.eviction_method = eviction_method
         self.baseline_order = baseline_order
         self.candidate_order = {}
@@ -235,6 +242,23 @@ class CustomCache:
         scores = self.cache_scorer.forward_layer(
             layer_id, hidden_states.float(), candidate_indices,
             head="score", block_indices=block_indices).float()
+        if self.accum_state is not None:
+            # H2O's time axis, mapped onto blocks. The student is trained with a
+            # listwise KL against the normalised label distribution, so its raw
+            # output is a ranking score whose scale carries no meaning across
+            # blocks; softmax is the quantity that was actually fit, and it also
+            # makes every block contribute exactly mass 1 the way per-head
+            # softmax does in H2O. Summing raw logits would instead let whichever
+            # block happened to have the widest spread decide the whole run.
+            prior = self.accum_state.get(layer_id)
+            if prior is None:
+                prior = torch.zeros(sequence_length, device=scores.device,
+                                    dtype=scores.dtype)
+            prior = prior * self.accum_decay
+            prior = prior.index_add(0, candidate_indices, scores.softmax(-1).squeeze(0))
+            self.accum_state[layer_id] = prior
+            scores = prior.index_select(0, candidate_indices).unsqueeze(0)
+
         keep_num = int(candidate_indices.numel() * self.keep_ratios[layer_id])
         keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
         if not self.baseline_order:

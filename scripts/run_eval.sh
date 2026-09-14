@@ -68,6 +68,11 @@ fi
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
   ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"
 fi
+# Off unless asked for, so every earlier row keeps its own resume key and its
+# model_args stay byte-identical to what produced it.
+if [ -n "${EVICTION_ACCUM:-}" ]; then
+  ARGS="$ARGS,eviction_accum=$EVICTION_ACCUM,eviction_accum_decay=${EVICTION_ACCUM_DECAY:-1.0}"
+fi
 if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   ARGS="$ARGS,diffusion_steps=${NLL_SAMPLES:-32}"
 fi

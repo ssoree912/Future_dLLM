@@ -11,6 +11,10 @@
 #   scripts/run_oc_mc.sh mmlu      # MMLU alone -- four fifths of the cost
 #   scripts/run_oc_mc.sh llada     # the LLaDA rows (needs a LLaDA checkpoint)
 #   scripts/run_oc_mc.sh llada-mmlu
+#   scripts/run_oc_mc.sh llada-k02       # our LLaDA row at keep_ratio 0.2
+#   scripts/run_oc_mc.sh llada-k01       # ... and at keep_ratio 0.1
+#   scripts/run_oc_mc.sh llada-k05       # ... and at keep_ratio 0.5
+#   scripts/run_oc_mc.sh llada-k02-smoke # ... two items per dataset first
 #
 # Env: FUTURE_DLLM_MODEL, FUTURE_DLLM_STUDENT, CUDA_VISIBLE_DEVICES.
 set -euo pipefail
@@ -21,7 +25,14 @@ cd "$REPO"
 # OpenCompass lives in its own venv, created with --system-site-packages from
 # future-dllm so it inherits the pinned torch/transformers. The tree there is
 # vanilla 0.4.2; everything of ours is under eval_oc/.
-OC_PYTHON="${OC_PYTHON:-/workspace/dllm/oc/ocenv/bin/python}"
+# The checkout has moved before, so the venv and its datasets are located
+# relative to this repo rather than at the absolute path they were created at.
+OC_ROOT="${OC_ROOT:-$(cd "$REPO/.." && pwd)/oc}"
+OC_PYTHON="${OC_PYTHON:-$OC_ROOT/ocenv/bin/python}"
+[ -x "$OC_PYTHON" ] || { echo "no OpenCompass interpreter at $OC_PYTHON (set OC_PYTHON or OC_ROOT)" >&2; exit 1; }
+# Dataset ids resolve against this, not against the cwd, so the tasks find
+# ARC/PIQA/GPQA while running from the future_dllm repo.
+export COMPASS_DATA_CACHE="${COMPASS_DATA_CACHE:-$OC_ROOT}"
 
 export FUTURE_DLLM_MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
 if [[ "${1:-}" == llada* ]]; then
@@ -42,6 +53,10 @@ case "${1:-}" in
   mmlu)  CONFIG="eval_oc/configs/eval_dream_mmlu.py";     shift ;;
   llada) CONFIG="eval_oc/configs/eval_llada_mc.py";       shift ;;
   llada-mmlu) CONFIG="eval_oc/configs/eval_llada_mmlu.py"; shift ;;
+  llada-k02)       CONFIG="eval_oc/configs/eval_llada_mc_k02.py";       shift ;;
+  llada-k01)       CONFIG="eval_oc/configs/eval_llada_mc_k01.py";       shift ;;
+  llada-k05)       CONFIG="eval_oc/configs/eval_llada_mc_k05.py";       shift ;;
+  llada-k02-smoke) CONFIG="eval_oc/configs/eval_llada_mc_k02_smoke.py"; shift ;;
   *)     CONFIG="eval_oc/configs/eval_dream_mc.py" ;;
 esac
 
@@ -49,8 +64,9 @@ mkdir -p logs/oc
 LOG="logs/oc/$(basename "${CONFIG%.py}")_$(date +%Y%m%d_%H%M%S).log"
 
 echo "config    $CONFIG"
-echo "model     $FUTURE_DLLM_MODEL"
-echo "student   $FUTURE_DLLM_STUDENT"
+echo "model     ${FUTURE_DLLM_LLADA_MODEL:-$FUTURE_DLLM_MODEL}"
+echo "student   ${FUTURE_DLLM_LLADA_STUDENT:-${FUTURE_DLLM_STUDENT:-}}"
+echo "data      $COMPASS_DATA_CACHE"
 echo "gpu       $CUDA_VISIBLE_DEVICES"
 echo "log       $LOG"
 
