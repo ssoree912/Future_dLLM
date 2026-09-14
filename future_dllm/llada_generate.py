@@ -37,7 +37,8 @@ def get_num_transfer_tokens(mask_index, steps):
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=32,
              temperature=0., cfg_scale=0., remasking='low_confidence',
-             mask_id=MASK_ID, cache_scorer=None, *, eviction_method="student"):
+             mask_id=MASK_ID, cache_scorer=None, *, eviction_method="student",
+             eviction_accum="none", eviction_accum_decay=1.0):
     """Generate ``gen_length`` tokens block by block.
 
     ``cache_scorer`` is a trained ``PromptUtilityStudent``; without one the model
@@ -47,9 +48,18 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
     ``eviction_method`` picks what decides the eviction: ``"student"`` uses the
     trained scorer, ``"sparse"`` uses Sparse-dLLM's attention score, which is
     what makes the baseline row runnable on this backend too.
+
+    ``eviction_accum="across_blocks"`` carries the scorer's own output forward
+    between blocks instead of deciding each block from scratch -- H2O's time
+    axis, with the block standing in for the AR step. ``eviction_accum_decay``
+    weights the carried history: 1.0 is a plain running sum, 0.0 reproduces the
+    per-block default. The state lives here because a cache lasts one block.
     """
     if eviction_method not in ("student", "sparse"):
         raise ValueError("eviction_method must be student or sparse")
+    if eviction_accum not in ("none", "across_blocks"):
+        raise ValueError("eviction_accum must be none or across_blocks")
+    accum_state = {} if eviction_accum == "across_blocks" else None
     if model.config.keep_ratio < 1 and eviction_method == "student" and cache_scorer is None:
         raise ValueError("student eviction requires a scorer")
     prompt_len = prompt.shape[1]
@@ -76,7 +86,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
             keep_ratio=model.config.keep_ratio,
             cache_scorer=cache_scorer, prompt_length=prompt_len,
             generation_length=gen_length,
-            eviction_method=eviction_method, baseline_order=True)
+            eviction_method=eviction_method, baseline_order=True,
+            accum_state=accum_state, accum_decay=eviction_accum_decay)
 
         block_start = prompt_len + num_block * block_length
         block_end = prompt_len + (num_block + 1) * block_length

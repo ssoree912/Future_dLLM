@@ -82,6 +82,8 @@ class FutureDLLM(HFLM):
         nll_type: str = "mc",
         log_type: str = "ftb",
         eviction_method: str = "student",
+        eviction_accum: str = "none",
+        eviction_accum_decay: float = 1.0,
         dream_alg: str = "entropy",
         dream_temperature: float = 0.2,
         dream_top_p: float = 0.95,
@@ -127,9 +129,13 @@ class FutureDLLM(HFLM):
         self._backend = backend
         if eviction_method not in ("student", "sparse"):
             raise ValueError("eviction_method must be student or sparse")
+        if eviction_accum not in ("none", "across_blocks"):
+            raise ValueError("eviction_accum must be none or across_blocks")
         if eviction_method == "sparse" and backend.name != "dream":
             raise ValueError("the sparse comparison mode is currently Dream-only")
         self._eviction_method = eviction_method
+        self._eviction_accum = str(eviction_accum)
+        self._eviction_accum_decay = float(eviction_accum_decay)
         self._dream_decoding = None
         self._dream_seed = int(dream_seed)
         if backend.name == "dream":
@@ -142,6 +148,8 @@ class FutureDLLM(HFLM):
         self._resume_identity = json.dumps({
             "model": str(pretrained), "student": student_path, "keep_ratio": self._keep_ratio,
             "eviction_method": eviction_method, "block_len": self._block_len,
+            "eviction_accum": self._eviction_accum,
+            "eviction_accum_decay": self._eviction_accum_decay,
             "max_seq_len": self._max_seq_len, "max_prompt_len": self._max_prompt_len,
             "decoding": self._dream_decoding.metadata() if self._dream_decoding else None,
             "dream_seed": self._dream_seed}, sort_keys=True)
@@ -206,6 +214,9 @@ class FutureDLLM(HFLM):
         if self._dream_decoding is not None:
             print(f"Dream decoding={self._dream_decoding.metadata()} "
                   f"seed={self._dream_seed} eviction_method={eviction_method}", flush=True)
+        if self._eviction_accum != "none":
+            print(f"[{backend.name}_future] eviction_accum={self._eviction_accum} "
+                  f"decay={self._eviction_accum_decay}", flush=True)
 
     def _shift(self, logits: torch.Tensor) -> torch.Tensor:
         """Move each row's prediction onto the position it describes.
@@ -427,7 +438,9 @@ class FutureDLLM(HFLM):
             temperature=float(gen_kwargs.get("temperature", 0.0)),
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0)),
             remasking=gen_kwargs.get("remasking") or "low_confidence",
-            cache_scorer=self._scorer)
+            cache_scorer=self._scorer,
+            eviction_accum=self._eviction_accum,
+            eviction_accum_decay=self._eviction_accum_decay)
 
     @torch.no_grad()
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:
