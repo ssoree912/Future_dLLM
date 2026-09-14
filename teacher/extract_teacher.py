@@ -245,14 +245,21 @@ def collect_dream(model, prompt_ids, args, backend):
     prompt = prompt_ids[-args.prompt_limit:].to(model.device).unsqueeze(0)
     records = []
 
+    per_head = bool(getattr(args, "per_head", False))
+
     def completed(x, cache, block_index, bs, selection_input):
         be = bs + args.block_length
         cache.capture_rows = True
+        cache.capture_per_head = per_head
         model(input_ids=x[:, bs:be], position_offset=bs, cache_state=2,
               customcache=cache, attention_mask="full")
         cache.capture_rows = False
         rows = [cache.pending_rows[layer] for layer in range(backend.n_layers)]
-        label = torch.stack([row.max(dim=0).values for row in rows])
+        # Per head a row arrives as [kv heads, block rows, candidates], so the
+        # max that turns rows into a label moves one axis right and the head
+        # axis survives it: [layers, kv heads, candidates].
+        row_axis = 1 if per_head else 0
+        label = torch.stack([row.max(dim=row_axis).values for row in rows])
         candidates = torch.cat([torch.arange(bs), torch.arange(be, x.shape[1])])
         record = {
             "block_index": block_index, "block_start": bs,
@@ -302,6 +309,9 @@ def run(family, description):
         decoding = DreamDecoding.from_args(args).metadata()
         print(f"decoding={decoding} seed={args.seed}", flush=True)
 
+    per_head = bool(getattr(args, "per_head", False))
+    teacher_kind = "final_rowmax_per_head" if per_head else "final_rowmax"
+
     out = Path(args.output_root) / args.dataset
     out.mkdir(parents=True, exist_ok=True)
     shards = sorted(glob.glob(f"{args.shard_root}/{args.dataset}/*.pt"))[: args.n_samples]
@@ -323,7 +333,16 @@ def run(family, description):
                 require_matching_decoding(saved.get("decoding"), decoding, target)
                 if saved.get("seed") != args.seed:
                     raise ValueError(f"{target}: teacher seed differs; use a new output root")
-            blocks = saved.get("blocks") or []
+            # A per-head shard and a head-averaged one agree on every length
+            # checked below and differ only in the label's rank, so the kind is
+            # checked first: pointed at the other root, the run rebuilds rather
+            # than resuming into a mixed set of labels.
+            if saved.get("teacher_kind") != teacher_kind:
+                print(f"rebuilding teacher shard from "
+                      f"{saved.get('teacher_kind')!r} to {teacher_kind!r}: "
+                      f"{target.name}", flush=True)
+                saved = None
+            blocks = (saved.get("blocks") or []) if saved is not None else []
             # The backend check matters as much as the lengths: a Dream and a
             # LLaDA shard for the same sample can agree on every length and
             # still hold labels from different models over different vocabs.
@@ -354,11 +373,20 @@ def run(family, description):
                    "prompt_limit": args.prompt_limit,
                    "gen_length": args.gen_length,
                    "max_seq_len": args.max_seq_len,
-                   "teacher_kind": ("final_rowmax_per_head"
-                                    if getattr(args, "per_head", False)
-                                    else "final_rowmax"),
+                   "teacher_kind": teacher_kind,
                    "attention_rows_saved": args.save_attention_rows,
                    "blocks": records}
+        if per_head and records:
+            # The head axis is the *KV* head axis: on a GQA backend the cache
+            # holds one entry per KV head, so that is the finest granularity
+            # eviction can act on, and the query heads sharing an entry are
+            # reduced with a max before the label is written. Recorded so a
+            # student reading these shards knows what its scores index.
+            payload.update(
+                per_head_axis="kv_heads",
+                per_head_group_reduce="max",
+                num_label_heads=int(records[0]["label_final_rowmax"].shape[1]),
+            )
         if decoding is not None:
             payload.update(decoding=decoding, seed=args.seed, sample_seed=item_seed)
         temporary = target.with_suffix(target.suffix + ".tmp")

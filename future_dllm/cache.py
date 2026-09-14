@@ -153,17 +153,37 @@ class CustomCache:
         Only used while collecting teacher labels. ``k`` holds the candidates
         followed by the block's own keys; the block columns are dropped so the
         rows score the cache alone.
+
+        Under ``capture_per_head`` the head axis survives, but it is a *KV* head
+        axis, not a query head one. On a GQA backend (Dream: 28 query heads over
+        4 KV heads) the cache holds one entry per KV head, so query heads that
+        share an entry cannot keep different entries -- a KV head is the finest
+        granularity eviction can act on, and the label has to be stated there.
         """
         if not self.capture_rows:
             return
-        if q.size(1) != k.size(1):
-            k = k.repeat_interleave(q.size(1) // k.size(1), dim=1)
+        kv_heads = k.size(1)
+        group = q.size(1) // kv_heads
+        if q.size(1) % kv_heads:
+            raise ValueError("query heads must be divisible by KV heads")
+        if group != 1:
+            k = k.repeat_interleave(group, dim=1)
         scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / (q.size(-1) ** 0.5)
         weights = torch.softmax(scores, dim=-1)
         n_cand = k.size(-2) - q.size(-2)
         rows = weights[..., :n_cand]
-        rows = (rows.squeeze(0) if self.capture_per_head
-                else rows.mean(dim=1).squeeze(0))
+        if self.capture_per_head:
+            if group != 1:
+                # Each query head needs its own softmax -- the distribution is
+                # what the label is made of -- so the group reduction happens
+                # after it, never before. Max, not mean: the entry a KV head
+                # keeps must serve the most demanding query head reading it,
+                # which is the argument the row max already makes one axis over.
+                batch, _, n_rows, n_cols = rows.shape
+                rows = rows.view(batch, kv_heads, group, n_rows, n_cols).amax(dim=2)
+            rows = rows.squeeze(0)
+        else:
+            rows = rows.mean(dim=1).squeeze(0)
         if layer_id in self.candidate_order:
             # Decode in score order, but keep teacher columns in natural order.
             natural_rows = torch.empty_like(rows)
