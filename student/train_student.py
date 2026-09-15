@@ -145,6 +145,7 @@ def load_shard(path, attempts=3):
 
 
 def main():
+    process_started = time.time()
     args = parse_args()
     if args.max_seq_len < 1:
         raise SystemExit("--max-seq-len must be positive")
@@ -333,7 +334,7 @@ def main():
                 sum(agreements) / len(agreements) if agreements else None,
                 sum(label_agreements) / len(label_agreements) if label_agreements else None)
 
-    best = -1.0
+    best, run_started = -1.0, time.time()
     for epoch in range(args.epochs):
         student.train(); random.shuffle(train_shards)
         started, losses = time.time(), []
@@ -384,6 +385,14 @@ def main():
                       open(out_dir / "best.json", "w"))
             print(f"  saved (best {best:.4f})", flush=True)
     print(f"done. best val recall {best:.4f} -> {out_dir}/checkpoint-best", flush=True)
+    # Same one-time-cost line the extractor prints, so the two halves of the
+    # offline budget are measured the same way and can simply be added.
+    print(f"cost: shards={len(train_shards) + len(val_shards)} epochs={args.epochs} "
+          f"train_h={(time.time() - run_started) / 3600:.4f} "
+          f"process_h={(time.time() - process_started) / 3600:.4f} "
+          f"peak_alloc_gib={torch.cuda.max_memory_allocated() / 2**30:.2f} "
+          f"peak_reserved_gib={torch.cuda.max_memory_reserved() / 2**30:.2f}",
+          flush=True)
     return 0
 
 

@@ -287,6 +287,7 @@ def collect_dream(model, prompt_ids, args, backend):
 
 def run(family, description):
     """Entry point body, called by the two family scripts."""
+    process_started = time.time()
     sys.path.insert(0, str(REPO_ROOT))
     args = parse_args(family, description)
     from future_dllm import load_model
@@ -396,6 +397,16 @@ def run(family, description):
             print(f"{i + 1}/{len(shards)}  {(time.time() - started) / (i + 1):.1f}s/sample",
                   flush=True)
     print(f"done: {len(list(out.glob('*.pt')))} shards total, {added} new -> {out}",
+          flush=True)
+    # One-time offline cost, per dataset. Reported here rather than timed from
+    # outside because the wall clock of the launcher also covers the shards this
+    # run resumed rather than generated, and because the peak is the process's
+    # own -- a card shared with another job would otherwise be read as ours.
+    print(f"cost: dataset={args.dataset} generated={added} "
+          f"generate_h={(time.time() - started) / 3600:.4f} "
+          f"process_h={(time.time() - process_started) / 3600:.4f} "
+          f"peak_alloc_gib={torch.cuda.max_memory_allocated() / 2**30:.2f} "
+          f"peak_reserved_gib={torch.cuda.max_memory_reserved() / 2**30:.2f}",
           flush=True)
     return 0
 
