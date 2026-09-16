@@ -45,8 +45,10 @@ official ``max_out_len=256`` the two agree.
 
 from __future__ import annotations
 
+import json
 import os
 import random
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -146,6 +148,18 @@ class DreamFutureOC(BaseModel):
             if not student_path:
                 raise ValueError("eviction_method='student' requires a scorer: "
                                  "set FUTURE_DLLM_STUDENT or pass student_path=")
+            if self._keep_ratio < 1:
+                # The lm-eval path already refuses a scorer built under a
+                # different decoding; this one did not, so the same checkpoint
+                # could be run here at a temperature its labels never saw and
+                # the row would look like every other row. Same check, same
+                # FUTURE_DLLM_ALLOW_SAMPLING_DRIFT escape hatch.
+                from future_dllm.dream_decoding import require_matching_decoding
+                saved_path = Path(student_path) / "decoding.json"
+                saved = (json.loads(saved_path.read_text())
+                         if saved_path.is_file() else None)
+                require_matching_decoding(saved, self._decoding.metadata(),
+                                          saved_path)
             self._scorer = load_prompt_utility_student(
                 student_path, next(self.model.parameters()).device)
         elif self._eviction_method != "sparse":
