@@ -21,6 +21,10 @@ metric_list:
 generation_kwargs:
   until:
     - "[DONE]"
+  # dLLM-cache runs MBPP at gen_length=512, steps=512 -- twice BBH's budget,
+  # because a solution plus its imports does not fit in 256. Without this the
+  # HFLM default of 256 would apply and the rows would not be theirs.
+  max_gen_toks: 512
   do_sample: false
 num_fewshot: 3
 fewshot_config:
