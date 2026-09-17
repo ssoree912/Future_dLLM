@@ -10,6 +10,7 @@
 # Examples:
 #   scripts/run_eval.sh samsum 0.1 artifacts/ckpts/<run>/checkpoint-best
 #   scripts/run_eval.sh gsm8k  1.0
+#   scripts/run_eval.sh bbh    0.1 artifacts/ckpts/<run>/checkpoint-best
 #   LIMIT=200 scripts/run_eval.sh math 0.1 artifacts/ckpts/<run>/checkpoint-best
 #   FUTURE_DLLM_MODEL=$PWD/model/Dream-v0-Instruct-7B scripts/run_eval.sh gsm8k 0.1 <ckpt>
 set -euo pipefail
@@ -40,6 +41,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 LIKELIHOOD_TASK=0
 UNSAFE_TASK=0
+CHAT_TASK=0
 case "$DATASET" in
   samsum|trec|triviaqa|2wikimqa|hotpotqa|musique|qasper|narrativeqa|multifieldqa_en|\
   gov_report|qmsum|multi_news|lcc|repobench-p|passage_retrieval_en|passage_count)
@@ -52,6 +54,15 @@ case "$DATASET" in
   math)       TASK=local_math;           SHOTS="" ;;
   math500)    TASK=local_math500;        SHOTS="" ;;
   humaneval)  TASK=local_humaneval;      SHOTS=""; UNSAFE_TASK=1 ;;
+  # dLLM-cache runs BBH as `--tasks bbh --num_fewshot 3 --apply_chat_template
+  # --fewshot_as_multiturn`; `bbh` is lm-eval's CoT few-shot group, and the two
+  # chat flags are what make the three shots separate turns rather than one
+  # flat prompt. Matching them is the point -- a BBH number scored without the
+  # chat template is not comparable to theirs.
+  bbh)        TASK=local_bbh;            SHOTS="--num_fewshot 3"; CHAT_TASK=1 ;;
+  # dLLM-cache runs MBPP with the same two chat flags as BBH, plus
+  # --confirm_run_unsafe_code, at 3 shots.
+  mbpp)       TASK=local_mbpp;           SHOTS="--num_fewshot 3"; CHAT_TASK=1; UNSAFE_TASK=1 ;;
   *) echo "unknown dataset: $DATASET" >&2; exit 1 ;;
 esac
 
@@ -98,7 +109,7 @@ cp "$REPO"/eval/tasks/local_*.py "$TASKS_DIR/"
 for y in "$REPO"/eval/tasks/longbench/*.yaml; do
   sed "s|LONGBENCH_DATA_DIR|$LONGBENCH_DATA|" "$y" > "$TASKS_DIR/$(basename "$y")"
 done
-for y in "$REPO"/eval/tasks/local/*.yaml "$REPO"/eval/tasks/local_mc/*; do
+for y in "$REPO"/eval/tasks/local/*.yaml "$REPO"/eval/tasks/local_mc/* "$REPO"/eval/tasks/local_bbh/*; do
   sed "s|DATA_DIR|$DATA_ROOT|" "$y" > "$TASKS_DIR/$(basename "$y")"
 done
 
@@ -123,6 +134,10 @@ if [ -n "${LIMIT:-}" ]; then
 fi
 if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
   EXTRA_ARGS+=(--apply_chat_template)
+fi
+if [ "$CHAT_TASK" -eq 1 ]; then
+  # --fewshot_as_multiturn is refused by lm-eval without --apply_chat_template.
+  EXTRA_ARGS+=(--apply_chat_template --fewshot_as_multiturn)
 fi
 if [ "$UNSAFE_TASK" -eq 1 ]; then
   export HF_ALLOW_CODE_EVAL=1

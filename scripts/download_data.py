@@ -21,6 +21,21 @@ from datasets import ClassLabel, Dataset, DatasetDict, Features, Value, load_dat
 from huggingface_hub import hf_hub_download
 
 
+# The 27 BIG-Bench Hard tasks, in lm-eval's own order (tasks/bbh/cot_fewshot/_bbh.yaml).
+BBH_TASKS = (
+    "boolean_expressions", "causal_judgement", "date_understanding",
+    "disambiguation_qa", "dyck_languages", "formal_fallacies",
+    "geometric_shapes", "hyperbaton", "logical_deduction_five_objects",
+    "logical_deduction_seven_objects", "logical_deduction_three_objects",
+    "movie_recommendation", "multistep_arithmetic_two", "navigate",
+    "object_counting", "penguins_in_a_table", "reasoning_about_colored_objects",
+    "ruin_names", "salient_translation_error_detection", "snarks",
+    "sports_understanding", "temporal_sequences",
+    "tracking_shuffled_objects_five_objects",
+    "tracking_shuffled_objects_seven_objects",
+    "tracking_shuffled_objects_three_objects", "web_of_lies", "word_sorting",
+)
+
 MATH_SUBJECTS = [
     "algebra",
     "counting_and_probability",
@@ -214,6 +229,22 @@ def download_eval(root: Path) -> None:
                   source_config=None, source_url=PIQA_URL, rows=rows)
 
 
+def download_bbh(root: Path) -> None:
+    """BIG-Bench Hard, one parquet per task.
+
+    lm-eval's bbh tasks read SaylorTwift/bbh, a mirror that adds a `default`
+    config on top of the original 27; the rows are the same, so the canonical
+    lukaemon/bbh is used here and the 27 configs are written out one file each,
+    the way eval/tasks/generate_local_bbh.py expects to find them.
+    """
+    rows = {}
+    for name in BBH_TASKS:
+        ds = _load("lukaemon/bbh", name)
+        rows[f"{name}.parquet"] = _write_parquet(ds["test"], root / f"eval/bbh/{name}.parquet")
+    _write_source(root / "eval/bbh/SOURCE.json", source_dataset="lukaemon/bbh",
+                  source_config=f"{len(BBH_TASKS)} configs, one file each", rows=rows)
+
+
 def download_humaneval(root: Path) -> None:
     ds = _load("openai/openai_humaneval")
     rows = {"test.parquet": _write_parquet(ds["test"], root / "eval/humaneval/test.parquet")}
@@ -346,7 +377,7 @@ def main() -> int:
     parser.add_argument(
         "--parts",
         nargs="+",
-        choices=("eval", "humaneval", "train", "longbench"),
+        choices=("eval", "humaneval", "bbh", "train", "longbench"),
         default=["eval", "train", "longbench"],
     )
     args = parser.parse_args()
@@ -357,6 +388,8 @@ def main() -> int:
         download_eval(root)
     elif "humaneval" in args.parts:
         download_humaneval(root)
+    if "bbh" in args.parts:
+        download_bbh(root)
     if "train" in args.parts:
         download_train(root)
     if "longbench" in args.parts:
