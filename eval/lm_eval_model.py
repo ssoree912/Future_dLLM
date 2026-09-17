@@ -405,9 +405,6 @@ class FutureDLLM(HFLM):
         from tqdm import tqdm
 
         results = []
-        measured_seconds = 0.0
-        measured_tokens = 0
-        measured_answers = 0
         iterator = tqdm(
             requests,
             disable=self.rank != 0,
@@ -472,6 +469,9 @@ class FutureDLLM(HFLM):
                   f"{len(done)} answers on disk", flush=True)
 
         results = []
+        measured_seconds = 0.0
+        measured_tokens = 0
+        measured_answers = 0
         bar = tqdm(total=len(requests), disable=(disable_tqdm or self.rank != 0),
                    desc="future_dllm generate_until")
         for request in requests:
