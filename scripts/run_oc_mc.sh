@@ -11,6 +11,11 @@
 #   scripts/run_oc_mc.sh mmlu      # MMLU alone -- four fifths of the cost
 #   scripts/run_oc_mc.sh llada     # the LLaDA rows (needs a LLaDA checkpoint)
 #   scripts/run_oc_mc.sh llada-mmlu
+#   scripts/run_oc_mc.sh llada-k02       # our LLaDA row at keep_ratio 0.2
+#   scripts/run_oc_mc.sh llada-k01       # ... and at keep_ratio 0.1
+#   scripts/run_oc_mc.sh llada-k01-arc   # ... ARC-C alone, on the test split
+#   scripts/run_oc_mc.sh llada-k05       # ... and at keep_ratio 0.5
+#   scripts/run_oc_mc.sh llada-k02-smoke # ... two items per dataset first
 #
 # Env: FUTURE_DLLM_MODEL, FUTURE_DLLM_STUDENT, CUDA_VISIBLE_DEVICES.
 set -euo pipefail
@@ -21,57 +26,39 @@ cd "$REPO"
 # OpenCompass lives in its own venv, created with --system-site-packages from
 # future-dllm so it inherits the pinned torch/transformers. The tree there is
 # vanilla 0.4.2; everything of ours is under eval_oc/.
-OC_PYTHON="${OC_PYTHON:-/workspace/dllm/oc/ocenv/bin/python}"
+# The checkout has moved before, so the venv and its datasets are located
+# relative to this repo rather than at the absolute path they were created at.
+OC_ROOT="${OC_ROOT:-$(cd "$REPO/.." && pwd)/oc}"
+OC_PYTHON="${OC_PYTHON:-$OC_ROOT/ocenv/bin/python}"
+[ -x "$OC_PYTHON" ] || { echo "no OpenCompass interpreter at $OC_PYTHON (set OC_PYTHON or OC_ROOT)" >&2; exit 1; }
+# Dataset ids resolve against this, not against the cwd, so the tasks find
+# ARC/PIQA/GPQA while running from the future_dllm repo.
+export COMPASS_DATA_CACHE="${COMPASS_DATA_CACHE:-$OC_ROOT}"
 
 export FUTURE_DLLM_MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/Dream-v0-Instruct-7B}"
-if [[ "${1:-}" == *llada* ]]; then
+if [[ "${1:-}" == llada* ]]; then
   # The LLaDA wrapper reads its own pair of variables, so a Dream checkpoint
   # can never be handed to a LLaDA run by accident.
   export FUTURE_DLLM_LLADA_MODEL="${FUTURE_DLLM_LLADA_MODEL:?set FUTURE_DLLM_LLADA_MODEL}"
   export FUTURE_DLLM_LLADA_STUDENT="${FUTURE_DLLM_LLADA_STUDENT:-}"
 else
-  export FUTURE_DLLM_STUDENT="${FUTURE_DLLM_STUDENT:-}"
+  export FUTURE_DLLM_STUDENT="${FUTURE_DLLM_STUDENT:?set FUTURE_DLLM_STUDENT to a checkpoint-best directory}"
 fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 # The config does `from eval_oc.model import DreamFutureOC`, and each task runs
 # in its own subprocess, so the repo has to be importable from the environment.
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-# opencompass.datasets pulls in nltk, which imports sqlite3; conda's
-# libicui18n.so.78 wants CXXABI_1.3.15 and the system libstdc++ is older, so the
-# import dies unless conda's own libstdc++ is found first.
-export LD_LIBRARY_PATH="/opt/conda/envs/future-dllm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
 
 case "${1:-}" in
   smoke) CONFIG="eval_oc/configs/eval_dream_mc_smoke.py"; shift ;;
   mmlu)  CONFIG="eval_oc/configs/eval_dream_mmlu.py";     shift ;;
   llada) CONFIG="eval_oc/configs/eval_llada_mc.py";       shift ;;
-  llada-smoke) CONFIG="eval_oc/configs/eval_llada_mc_smoke.py"; shift ;;
-  llada-fastdllm) CONFIG="eval_oc/configs/eval_llada_fastdllm.py"; shift ;;
-  llada-fastdllm-smoke) CONFIG="eval_oc/configs/eval_llada_fastdllm_smoke.py"; shift ;;
-  llada-dllmcache) CONFIG="eval_oc/configs/eval_llada_dllmcache.py"; shift ;;
-  llada-dllmcache-smoke) CONFIG="eval_oc/configs/eval_llada_dllmcache_smoke.py"; shift ;;
-  dream-fastdllm) CONFIG="eval_oc/configs/eval_dream_fastdllm.py"; shift ;;
-  dream-fastdllm-smoke) CONFIG="eval_oc/configs/eval_dream_fastdllm_smoke.py"; shift ;;
-  dream-dllmcache) CONFIG="eval_oc/configs/eval_dream_dllmcache.py"; shift ;;
-  dream-dllmcache-smoke) CONFIG="eval_oc/configs/eval_dream_dllmcache_smoke.py"; shift ;;
-  llada-full) CONFIG="eval_oc/configs/eval_llada_full.py"; shift ;;
-  llada-full-smoke) CONFIG="eval_oc/configs/eval_llada_full_smoke.py"; shift ;;
-  dream-full) CONFIG="eval_oc/configs/eval_dream_full.py"; shift ;;
-  dream-full-smoke) CONFIG="eval_oc/configs/eval_dream_full_smoke.py"; shift ;;
-  llada-sparse-k02) CONFIG="eval_oc/configs/eval_llada_sparse_k02.py"; shift ;;
-  llada-sparse-k02-smoke) CONFIG="eval_oc/configs/eval_llada_sparse_k02_smoke.py"; shift ;;
-  llada-sparse-k01) CONFIG="eval_oc/configs/eval_llada_sparse_k01.py"; shift ;;
-  llada-sparse-k01-smoke) CONFIG="eval_oc/configs/eval_llada_sparse_k01_smoke.py"; shift ;;
-  dream-sparse-k01) CONFIG="eval_oc/configs/eval_dream_sparse_k01.py"; shift ;;
-  dream-sparse-k01-smoke) CONFIG="eval_oc/configs/eval_dream_sparse_k01_smoke.py"; shift ;;
-  dream-origin) CONFIG="eval_oc/configs/eval_dream_origin.py"; shift ;;
-  dream-origin-smoke) CONFIG="eval_oc/configs/eval_dream_origin_smoke.py"; shift ;;
-  cache-llada) CONFIG="eval_oc/configs/eval_llada_cache_methods.py"; shift ;;
-  cache-llada-smoke) CONFIG="eval_oc/configs/eval_llada_cache_methods_smoke.py"; shift ;;
-  cache-dream-smoke) CONFIG="eval_oc/configs/eval_dream_cache_methods_smoke.py"; shift ;;
-  cache-dream) CONFIG="eval_oc/configs/eval_dream_cache_methods.py"; shift ;;
   llada-mmlu) CONFIG="eval_oc/configs/eval_llada_mmlu.py"; shift ;;
+  llada-k02)       CONFIG="eval_oc/configs/eval_llada_mc_k02.py";       shift ;;
+  llada-k01)       CONFIG="eval_oc/configs/eval_llada_mc_k01.py";       shift ;;
+  llada-k01-arc)   CONFIG="eval_oc/configs/eval_llada_mc_k01_arc.py";   shift ;;
+  llada-k05)       CONFIG="eval_oc/configs/eval_llada_mc_k05.py";       shift ;;
+  llada-k02-smoke) CONFIG="eval_oc/configs/eval_llada_mc_k02_smoke.py"; shift ;;
   *)     CONFIG="eval_oc/configs/eval_dream_mc.py" ;;
 esac
 
@@ -79,8 +66,9 @@ mkdir -p logs/oc
 LOG="logs/oc/$(basename "${CONFIG%.py}")_$(date +%Y%m%d_%H%M%S).log"
 
 echo "config    $CONFIG"
-echo "model     $FUTURE_DLLM_MODEL"
-echo "student   ${FUTURE_DLLM_STUDENT:-${FUTURE_DLLM_LLADA_STUDENT:-(none)}}"
+echo "model     ${FUTURE_DLLM_LLADA_MODEL:-$FUTURE_DLLM_MODEL}"
+echo "student   ${FUTURE_DLLM_LLADA_STUDENT:-${FUTURE_DLLM_STUDENT:-}}"
+echo "data      $COMPASS_DATA_CACHE"
 echo "gpu       $CUDA_VISIBLE_DEVICES"
 echo "log       $LOG"
 
