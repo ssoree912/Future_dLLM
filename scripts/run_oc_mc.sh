@@ -13,6 +13,7 @@
 #   scripts/run_oc_mc.sh llada-mmlu
 #   scripts/run_oc_mc.sh llada-k02       # our LLaDA row at keep_ratio 0.2
 #   scripts/run_oc_mc.sh llada-k01       # ... and at keep_ratio 0.1
+#   scripts/run_oc_mc.sh llada-k01-arc   # ... ARC-C alone, on the test split
 #   scripts/run_oc_mc.sh llada-k05       # ... and at keep_ratio 0.5
 #   scripts/run_oc_mc.sh llada-k02-smoke # ... two items per dataset first
 #
@@ -55,6 +56,7 @@ case "${1:-}" in
   llada-mmlu) CONFIG="eval_oc/configs/eval_llada_mmlu.py"; shift ;;
   llada-k02)       CONFIG="eval_oc/configs/eval_llada_mc_k02.py";       shift ;;
   llada-k01)       CONFIG="eval_oc/configs/eval_llada_mc_k01.py";       shift ;;
+  llada-k01-arc)   CONFIG="eval_oc/configs/eval_llada_mc_k01_arc.py";   shift ;;
   llada-k05)       CONFIG="eval_oc/configs/eval_llada_mc_k05.py";       shift ;;
   llada-k02-smoke) CONFIG="eval_oc/configs/eval_llada_mc_k02_smoke.py"; shift ;;
   *)     CONFIG="eval_oc/configs/eval_dream_mc.py" ;;
