@@ -22,6 +22,7 @@ CKPT="${3:-}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-python}"
 MODEL="${FUTURE_DLLM_MODEL:-$REPO/model/LLaDA-8B-Instruct}"
+[ -d "$MODEL" ] || MODEL="${FUTURE_DLLM_MODEL:-$REPO/../Future_dLLM/model/LLaDA-8B-Instruct}"
 # lm-eval needs a registered name; both map to the same class, which picks the
 # family from the checkpoint. Keeping the names distinct means a run's log says
 # which family it thought it was loading.

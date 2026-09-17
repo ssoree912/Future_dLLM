@@ -13,6 +13,11 @@ mkdir -p "$(dirname "$LOG")"
 source /opt/conda/etc/profile.d/conda.sh
 conda activate future-dllm
 export CUDA_VISIBLE_DEVICES="$GPU" LIMIT
+SAMPLE_ROOT="${BENCH_DATA:-$REPO/.bench_samples_${LIMIT}_seed20260917}"
+if [ ! -d "$SAMPLE_ROOT" ]; then
+  python "$REPO/scripts/prepare_benchmark_samples.py" --source "$REPO/../Future_dLLM/data" --output "$SAMPLE_ROOT" --limit "$LIMIT" >/dev/null
+fi
+export FUTURE_DLLM_DATA="$SAMPLE_ROOT"
 
 for ratio in 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9; do
   for ds in gsm8k math humaneval; do
