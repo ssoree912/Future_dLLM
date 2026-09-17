@@ -443,6 +443,7 @@ class FutureDLLM(HFLM):
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0)),
             remasking=gen_kwargs.get("remasking") or "low_confidence",
             cache_scorer=self._scorer,
+            eviction_method=self._eviction_method,
             eviction_accum=self._eviction_accum,
             eviction_accum_decay=self._eviction_accum_decay)
 
