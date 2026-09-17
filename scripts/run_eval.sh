@@ -62,8 +62,11 @@ fi
 
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-$DEFAULT_MAX_SEQ_LEN}"
 ARGS="pretrained=$MODEL,block_len=32,keep_ratio=$KEEP,max_seq_len=$MAX_SEQ_LEN"
+# llada_generate takes eviction_method too now, so the Sparse-dLLM baseline is
+# reachable on both families; only the dream_* decoding knobs stay Dream-only.
+ARGS="$ARGS,eviction_method=$EVICTION_METHOD"
 if [ "$MODEL_NAME" = Dream_future ]; then
-  ARGS="$ARGS,eviction_method=$EVICTION_METHOD,dream_alg=$DREAM_ALG,dream_temperature=$DREAM_TEMPERATURE,dream_top_p=$DREAM_TOP_P,dream_steps=$DREAM_STEPS,dream_seed=$DREAM_SEED"
+  ARGS="$ARGS,dream_alg=$DREAM_ALG,dream_temperature=$DREAM_TEMPERATURE,dream_top_p=$DREAM_TOP_P,dream_steps=$DREAM_STEPS,dream_seed=$DREAM_SEED"
 fi
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
   ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"

@@ -127,8 +127,6 @@ class FutureDLLM(HFLM):
         self._backend = backend
         if eviction_method not in ("student", "sparse"):
             raise ValueError("eviction_method must be student or sparse")
-        if eviction_method == "sparse" and backend.name != "dream":
-            raise ValueError("the sparse comparison mode is currently Dream-only")
         self._eviction_method = eviction_method
         self._dream_decoding = None
         self._dream_seed = int(dream_seed)
@@ -427,7 +425,7 @@ class FutureDLLM(HFLM):
             temperature=float(gen_kwargs.get("temperature", 0.0)),
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0)),
             remasking=gen_kwargs.get("remasking") or "low_confidence",
-            cache_scorer=self._scorer)
+            cache_scorer=self._scorer, eviction_method=self._eviction_method)
 
     @torch.no_grad()
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:
