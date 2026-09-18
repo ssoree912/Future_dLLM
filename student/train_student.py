@@ -228,7 +228,10 @@ def main():
         raise SystemExit(f"teacher roots disagree on the label: kinds={sorted(kinds)} "
                          f"heads={sorted(label_heads)}; train one kind at a time")
     teacher_kind, K = sorted(kinds)[0], sorted(label_heads)[0]
-    per_head = teacher_kind.endswith("_per_head")
+    # Containment, not a suffix: the kind also records the group reduction
+    # when it is not the default, so "final_rowmean_per_head_groupmean"
+    # is per-head too.
+    per_head = "_per_head" in teacher_kind
     if per_head != (K > 1):
         raise SystemExit(f"teacher_kind={teacher_kind} but num_label_heads={K}")
     print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
