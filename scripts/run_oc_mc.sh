@@ -9,6 +9,10 @@
 #   scripts/run_oc_mc.sh smoke     # 2 items per dataset, student row only
 #   scripts/run_oc_mc.sh           # GPQA + ARC-C + PIQA, all three rows
 #   scripts/run_oc_mc.sh mmlu      # MMLU alone -- four fifths of the cost
+#   scripts/run_oc_mc.sh k02-sparse # Sparse-dLLM keep 0.2, greedy, no MMLU
+#   scripts/run_oc_mc.sh k01       # keep 0.1, ours and Sparse-dLLM, no MMLU
+#   scripts/run_oc_mc.sh k01-t02   # ... the temperature 0.2 student instead
+#   scripts/run_oc_mc.sh k05-t02   # ... the same student at keep 0.5
 #   scripts/run_oc_mc.sh llada     # the LLaDA rows (needs a LLaDA checkpoint)
 #   scripts/run_oc_mc.sh llada-mmlu
 #   scripts/run_oc_mc.sh llada-k02       # our LLaDA row at keep_ratio 0.2
@@ -53,6 +57,10 @@ case "${1:-}" in
   smoke) CONFIG="eval_oc/configs/eval_dream_mc_smoke.py"; shift ;;
   mmlu)  CONFIG="eval_oc/configs/eval_dream_mmlu.py";     shift ;;
   llada) CONFIG="eval_oc/configs/eval_llada_mc.py";       shift ;;
+  k02-sparse) CONFIG="eval_oc/configs/eval_dream_mc_k02_sparse.py"; shift ;;
+  k01) CONFIG="eval_oc/configs/eval_dream_mc_k01.py"; shift ;;
+  k01-t02) CONFIG="eval_oc/configs/eval_dream_mc_k01_t02.py"; shift ;;
+  k05-t02) CONFIG="eval_oc/configs/eval_dream_mc_k05_t02.py"; shift ;;
   llada-mmlu) CONFIG="eval_oc/configs/eval_llada_mmlu.py"; shift ;;
   llada-k02)       CONFIG="eval_oc/configs/eval_llada_mc_k02.py";       shift ;;
   llada-k01)       CONFIG="eval_oc/configs/eval_llada_mc_k01.py";       shift ;;
