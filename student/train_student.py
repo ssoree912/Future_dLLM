@@ -347,15 +347,20 @@ def main():
             if not bool(usable.any()):
                 continue
             rows_t, rows_p = rows_t[usable], rows_p[usable]
-            # listwise: KL against the normalised label distribution. reduction has to
-            # be "sum" — pred is 1-D, so "batchmean" would divide the KL by the
-            # candidate count and shrink the term by 132x (mmlu) to 2528x
+            # listwise: KL against the normalised label distribution. The sum
+            # over candidates has to stay a sum — "batchmean" would divide by
+            # the candidate count and shrink the term by 132x (mmlu) to 2528x
             # (gov_report), silently weighting domains by their prompt length.
-            # Summing over heads as well keeps each head's term the size it
-            # would have been on its own.
-            loss = args.lambda_list * F.kl_div(
-                F.log_softmax(rows_p, -1),
-                rows_t / rows_t.sum(-1, keepdim=True), reduction="sum")
+            # Over heads it is a mean, matching the pairwise term below. A sum
+            # there instead would scale only this term with the head count,
+            # which makes --lambda-list mean something different per backend:
+            # 4 KV heads on Dream against 32 on LLaDA, from one nominal 1.0.
+            # Mean on both keeps the two terms' balance fixed and keeps --lr at
+            # the value the head-averaged scorer was tuned at.
+            kl = F.kl_div(F.log_softmax(rows_p, -1),
+                          rows_t / rows_t.sum(-1, keepdim=True),
+                          reduction="none").sum(-1)
+            loss = args.lambda_list * kl.mean()
             # pairwise: random pairs anywhere in the range, to fix the ordering.
             # The same pair indices go to every head; the labels differ per head,
             # so the constraint each head gets is its own.
