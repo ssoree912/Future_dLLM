@@ -74,6 +74,31 @@ def detect_family(model_path: str | Path) -> str:
     )
 
 
+
+def _llada_kv_heads(cfg) -> int:
+    """LLaDA's KV head count, however its config spells it.
+
+    ``effective_n_kv_heads`` is a property of the ``ModelConfig`` dataclass in
+    configuration_llada.py, not of the ``LLaDAConfig`` that AutoConfig returns,
+    so reading it off the loaded config raises AttributeError. The rule below is
+    that property's, applied to whichever object we were handed.
+    """
+    effective = getattr(cfg, "effective_n_kv_heads", None)
+    if effective is not None:
+        return int(effective)
+    n_kv_heads = getattr(cfg, "n_kv_heads", None)
+    multi_query = getattr(cfg, "multi_query_attention", None)
+    if n_kv_heads is None:
+        return 1 if multi_query is True else int(cfg.n_heads)
+    if multi_query is None:
+        return int(n_kv_heads)
+    expected = 1 if multi_query else int(cfg.n_heads)
+    if int(n_kv_heads) != expected:
+        raise ValueError(
+            "LLaDA config sets both multi_query_attention and a conflicting "
+            f"n_kv_heads ({n_kv_heads} against {expected})")
+    return expected
+
 def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
                keep_ratio: float = 1.0, device_map: str = "auto") -> tuple[torch.nn.Module, Backend]:
     """Load a checkpoint with the eviction cache wired in, and describe it.
@@ -130,7 +155,7 @@ def load_model(model_path: str | Path, *, max_seq_len: int, block_length: int,
         mask_id=126336,
         n_layers=int(cfg.n_layers),
         hidden_dim=int(cfg.d_model),
-        kv_heads=int(cfg.effective_n_kv_heads),
+        kv_heads=_llada_kv_heads(cfg),
         native_max_seq_len=native,
         generate=llada_generate,
         logit_shift=False,

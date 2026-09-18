@@ -466,7 +466,8 @@ class FutureDLLM(HFLM):
             cache_scorer=self._scorer,
             eviction_method=self._eviction_method,
             eviction_accum=self._eviction_accum,
-            eviction_accum_decay=self._eviction_accum_decay)
+            eviction_accum_decay=self._eviction_accum_decay,
+            oracle_reduce=self._oracle_reduce)
 
     @torch.no_grad()
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:
