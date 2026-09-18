@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -92,6 +93,7 @@ class FutureDLLM(HFLM):
         dream_eps: float = 1e-3,
         dream_top_k=None,
         dream_alg_temp=None,
+        show_speed: bool = True,
         **kwargs,
     ):
         from future_dllm import load_model, load_prompt_utility_student
@@ -104,6 +106,7 @@ class FutureDLLM(HFLM):
         self._sampling_eps = float(sampling_eps)
         self._nll_type = str(nll_type)
         self._log_type = str(log_type)
+        self._show_speed = bool(show_speed)
 
         if not 0.0 < self._keep_ratio <= 1.0:
             raise ValueError("keep_ratio must be in (0, 1]")
@@ -131,8 +134,6 @@ class FutureDLLM(HFLM):
             raise ValueError("eviction_method must be student or sparse")
         if eviction_accum not in ("none", "across_blocks"):
             raise ValueError("eviction_accum must be none or across_blocks")
-        if eviction_method == "sparse" and backend.name != "dream":
-            raise ValueError("the sparse comparison mode is currently Dream-only")
         self._eviction_method = eviction_method
         self._eviction_accum = str(eviction_accum)
         self._eviction_accum_decay = float(eviction_accum_decay)
@@ -439,6 +440,7 @@ class FutureDLLM(HFLM):
             cfg_scale=float(gen_kwargs.get("cfg_scale", 0.0)),
             remasking=gen_kwargs.get("remasking") or "low_confidence",
             cache_scorer=self._scorer,
+            eviction_method=self._eviction_method,
             eviction_accum=self._eviction_accum,
             eviction_accum_decay=self._eviction_accum_decay)
 
@@ -467,6 +469,9 @@ class FutureDLLM(HFLM):
                   f"{len(done)} answers on disk", flush=True)
 
         results = []
+        measured_seconds = 0.0
+        measured_tokens = 0
+        measured_answers = 0
         bar = tqdm(total=len(requests), disable=(disable_tqdm or self.rank != 0),
                    desc="future_dllm generate_until")
         for request in requests:
@@ -494,13 +499,18 @@ class FutureDLLM(HFLM):
                 [context], truncation=self.truncation,
                 left_truncate_len=prompt_limit)
 
+            started = time.perf_counter()
             out = self._call_generate(context_enc, gen_kwargs, gen_length)
+            elapsed = time.perf_counter() - started
             text = self.tokenizer.decode(out[0, context_enc.shape[1]:],
                                          skip_special_tokens=True)
             for term in gen_kwargs.get("until") or []:
                 if term:
                     text = text.split(term)[0]
             results.append(text)
+            measured_seconds += elapsed
+            measured_tokens += len(self.tokenizer.encode(text, add_special_tokens=False))
+            measured_answers += 1
             if store is not None:
                 store.write(json.dumps({"key": key, "text": text}) + "\n")
                 store.flush()
@@ -509,4 +519,11 @@ class FutureDLLM(HFLM):
         bar.close()
         if store is not None:
             store.close()
+        if self._show_speed and measured_answers:
+            print(
+                f"[{self._backend.name}_future] generated {measured_answers} answers, "
+                f"{measured_tokens} decoded tokens in {measured_seconds:.1f}s "
+                f"({measured_tokens / measured_seconds:.2f} tok/s)",
+                flush=True,
+            )
         return results

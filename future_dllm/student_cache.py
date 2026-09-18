@@ -17,11 +17,12 @@ class StudentConfig:
     proj_dim: int = 256
     mlp_dim: int = 512
     heads: tuple[str, ...] = ("score",)
-    # Attention KV heads the scorer emits one row per, matching the teacher
-    # label's head axis. 1 is the head-averaged student this repo shipped: one
-    # score per candidate, one kept set shared by every head. Distinct from
-    # ``heads`` above, which names *task* heads ("score"), not attention ones.
-    kv_heads: int = 1
+    # Attention heads scored separately. 1 is the head-averaged scorer this repo
+    # shipped: one score per position, one kept set per layer. Larger means the
+    # readout emits one score per attention head, so each head can keep its own
+    # top-k. Only the readout widens -- the projections stay shared, which is
+    # what keeps the checkpoint the same size to within a couple of MB.
+    attn_heads: int = 1
 
 
 def _normalize_heads(heads: tuple[str, ...] | list[str] | str) -> tuple[str, ...]:
@@ -38,16 +39,16 @@ def _build_score_head(config: StudentConfig) -> nn.Sequential:
     # [candidate ; current-block ; candidate * current-block]
     width = config.proj_dim * 3
     # The trunk stays shared and only the readout widens: the features a
-    # candidate is scored from are the same whichever KV head reads it, so what
+    # candidate is scored from are the same whichever head reads it, so what
     # differs per head is how those features are weighed, which is exactly a
-    # linear readout. kv_heads=1 reproduces the original [mlp_dim, 1] weight, so
-    # checkpoints written before this existed still load.
-    if config.kv_heads < 1:
-        raise RuntimeError(f"invalid student kv_heads: {config.kv_heads}")
+    # linear readout. attn_heads=1 reproduces the original [mlp_dim, 1] weight,
+    # so checkpoints written before this existed still load.
+    if config.attn_heads < 1:
+        raise RuntimeError(f"invalid student attn_heads: {config.attn_heads}")
     return nn.Sequential(
         nn.Linear(width, config.mlp_dim),
         nn.GELU(),
-        nn.Linear(config.mlp_dim, config.kv_heads),
+        nn.Linear(config.mlp_dim, config.attn_heads),
     )
 
 
@@ -55,7 +56,7 @@ class PromptUtilityStudentLayer(nn.Module):
     def __init__(self, config: StudentConfig) -> None:
         super().__init__()
         self.heads = _normalize_heads(config.heads)
-        self.kv_heads = int(config.kv_heads)
+        self.attn_heads = int(config.attn_heads)
         self.token_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         self.block_proj = nn.Linear(config.hidden_dim, config.proj_dim)
         if self.heads == ("score",):
@@ -93,9 +94,11 @@ class PromptUtilityStudentLayer(nn.Module):
         )
         fused = torch.cat([token_proj, block_proj, token_proj * block_proj], dim=-1)
         scores = self._head(head)(fused)
-        if self.kv_heads == 1:
+        if self.attn_heads == 1:
             return scores.squeeze(-1)                  # [batch, candidates]
-        return scores.transpose(1, 2)                  # [batch, kv heads, candidates]
+        # [batch, attn heads, candidates]: heads first, so a top-k over the last
+        # axis gives each head its own kept set.
+        return scores.transpose(-2, -1)
 
 
 class PromptUtilityStudent(nn.Module):
@@ -108,7 +111,7 @@ class PromptUtilityStudent(nn.Module):
             proj_dim=config.proj_dim,
             mlp_dim=config.mlp_dim,
             heads=heads,
-            kv_heads=config.kv_heads,
+            attn_heads=config.attn_heads,
         )
         self.layer_indices = tuple(range(self.config.layer_count))
         self.layers = nn.ModuleDict(
@@ -150,6 +153,11 @@ def load_prompt_utility_student(
         )
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     raw_config["heads"] = tuple(raw_config.get("heads", ("score",)))
+    # Checkpoints written before the field was renamed carry kv_heads. Same
+    # axis, same weights -- only the name moved -- so they load unchanged rather
+    # than failing on an unexpected keyword.
+    if "kv_heads" in raw_config:
+        raw_config.setdefault("attn_heads", raw_config.pop("kv_heads"))
     legacy_cond = raw_config.pop("cond", None)
     if legacy_cond not in (None, "blk"):
         raise RuntimeError(

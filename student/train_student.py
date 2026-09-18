@@ -67,27 +67,29 @@ def parse_args():
                         "N prompts of each domain, 0 = all. The cut is taken before "
                         "the val split, "
                         "so val stays the same fraction of what is used.")
+    p.add_argument("--resume", action="store_true",
+                   help="resume from the latest checkpoint-epoch-* under the output directory")
     return p.parse_args()
 
 
 def recall_grid(pred, target, ratios=(0.05, 0.1, 0.2, 0.3, 0.5)):
-    """Mean overlap of the kept sets over a budget grid.
+    """Mean top-k agreement over the grid, averaged over attention heads.
 
-    Both arguments are either ``[candidates]`` or, per head, ``[kv heads,
-    candidates]`` -- the budget is per head either way, so ``k`` comes off the
-    candidate axis and a per-head recall is averaged over the heads.
+    Takes [candidates] or [heads, candidates]. Per head there are 32 layers x 32
+    heads of these per record, so the set arithmetic this used to do in Python
+    is done on the device instead.
     """
+    p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+    t = target if target.dim() == 2 else target.unsqueeze(0)
+    n = t.shape[-1]
     out = []
     for r in ratios:
-        k = max(1, int(target.shape[-1] * r))
-        a = torch.topk(pred, k, dim=-1).indices
-        b = torch.topk(target, k, dim=-1).indices
-        if target.ndim == 1:
-            out.append(len(set(a.tolist()) & set(b.tolist())) / k)
-        else:
-            out.append(sum(len(set(x.tolist()) & set(y.tolist())) / k
-                           for x, y in zip(a, b)) / target.shape[0])
-    return sum(out) / len(out)
+        k = max(1, int(n * r))
+        chosen = p.topk(k, dim=-1).indices
+        mark = torch.zeros_like(t, dtype=torch.bool)
+        mark.scatter_(-1, t.topk(k, dim=-1).indices, True)
+        out.append(mark.gather(-1, chosen).sum(-1).float().mean() / k)
+    return float(sum(out) / len(out))
 
 
 def head_agreement(pred, ratio=0.2):
@@ -229,13 +231,6 @@ def main():
     per_head = teacher_kind.endswith("_per_head")
     if per_head != (K > 1):
         raise SystemExit(f"teacher_kind={teacher_kind} but num_label_heads={K}")
-    # The label's head axis is the cache's KV head axis, so a mismatch here means
-    # the scorer would emit a kept set the cache cannot be indexed with -- the one
-    # error in this path that still produces a loadable-looking checkpoint.
-    if per_head and K != backend.kv_heads:
-        raise SystemExit(
-            f"teacher labels carry {K} heads but {backend.name} has "
-            f"{backend.kv_heads} KV heads; these labels came from another model")
     print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
           f"{' (per KV head)' if per_head else ' (head-averaged)'}", flush=True)
 
@@ -245,10 +240,29 @@ def main():
         (args.name or checkpoint_name(datasets, counts, args.epochs, args.lr)))
     print(f"checkpoint -> {out_dir}", flush=True)
 
+    # Per-head labels carry an extra axis, [layers, heads, candidates], and the
+    # readout has to be as wide as that axis. Read it off the data rather than
+    # taking it as a flag: a mismatch here trains silently against the wrong
+    # target instead of failing.
+    probe = load_shard(train_shards[0][1])["blocks"][0]["label_final_rowmax"]
+    attn_heads = int(probe.shape[1]) if probe.dim() == 3 else 1
+    print(f"teacher labels: {tuple(probe.shape)} -> attn_heads={attn_heads}", flush=True)
+    if attn_heads != K:
+        raise SystemExit(f"shard metadata says {K} label heads but the label "
+                         f"tensor has {attn_heads}; the root is inconsistent")
+    # The label's head axis is the cache's KV head axis, so a scorer wider or
+    # narrower than the backbone's KV heads emits a kept set the cache cannot be
+    # indexed with -- the one mismatch here that still yields a loadable
+    # checkpoint.
+    if per_head and attn_heads != backend.kv_heads:
+        raise SystemExit(f"teacher labels carry {attn_heads} heads but "
+                         f"{backend.name} has {backend.kv_heads} KV heads")
+
     # Same class the deployment path loads, so the checkpoint drops straight in.
     from future_dllm import PromptUtilityStudent, StudentConfig
     student_cfg = StudentConfig(layer_count=L, hidden_dim=H, proj_dim=args.proj_dim,
-                                mlp_dim=args.mlp_dim, heads=("score",), kv_heads=K)
+                                mlp_dim=args.mlp_dim, heads=("score",),
+                                attn_heads=attn_heads)
     student = PromptUtilityStudent(student_cfg).to(device).float()
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -258,13 +272,41 @@ def main():
                "block_length": args.block_length,
                "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
                "proj_dim": args.proj_dim, "mlp_dim": args.mlp_dim,
+               "attn_heads": attn_heads,
                "val_ratio": args.val_ratio, "pairs": args.pairs,
                "max_seq_len": args.max_seq_len,
                "lambda_list": args.lambda_list,
                "teacher_roots": roots,
-               "teacher_kind": teacher_kind, "kv_heads": K,
+               "teacher_kind": teacher_kind, "attn_heads": K,
                "max_shards": dict(zip(datasets, shard_caps)) if shard_caps else {}},
               open(out_dir / "meta.json", "w"), indent=2)
+
+    start_epoch = 0
+    best, run_started = -1.0, time.time()
+    if args.resume:
+        epoch_dirs = []
+        for path in out_dir.glob("checkpoint-epoch-*"):
+            try:
+                epoch_dirs.append((int(path.name.rsplit("-", 1)[-1]), path))
+            except ValueError:
+                continue
+        if not epoch_dirs:
+            raise SystemExit(f"--resume requested but no epoch checkpoints under {out_dir}")
+        last_epoch, last_dir = max(epoch_dirs)
+        weights = last_dir / "pytorch_model.bin"
+        optimizer = last_dir / "optimizer.pt"
+        state = last_dir / "trainer_state.json"
+        student.load_state_dict(torch.load(weights, map_location=device, weights_only=True))
+        opt.load_state_dict(torch.load(optimizer, map_location=device, weights_only=True))
+        saved_state = json.loads(state.read_text())
+        start_epoch = int(saved_state["epoch"]) + 1
+        best_path = out_dir / "best.json"
+        if best_path.exists():
+            best = float(json.loads(best_path.read_text()).get("val_recall", -1.0))
+        if start_epoch >= args.epochs:
+            print(f"resume checkpoint is already at epoch {start_epoch}; requested epochs={args.epochs}", flush=True)
+            return 0
+        print(f"resuming from {last_dir} at epoch {start_epoch}", flush=True)
 
     @torch.no_grad()
     def features(record):
@@ -295,47 +337,54 @@ def main():
             pred = student.forward_layer(l, h, cand, head="score",
                                          block_indices=blk).squeeze(0)
             tgt = label[l]
-            if not torch.isfinite(tgt).all() or (tgt.sum(-1) <= 0).any():
+            # One head-averaged row or one row per attention head: the last axis
+            # is candidates either way, so the terms below are written against
+            # [rows, candidates] and the head-averaged case is simply one row.
+            rows_t = tgt if tgt.dim() == 2 else tgt.unsqueeze(0)
+            rows_p = pred if pred.dim() == 2 else pred.unsqueeze(0)
+            mass = rows_t.sum(-1)
+            usable = torch.isfinite(rows_t).all(-1) & (mass > 0)
+            if not bool(usable.any()):
                 continue
-            # listwise: KL against the normalised label distribution. The sum is
-            # over candidates and must stay a sum — "batchmean" would divide the
-            # KL by the candidate count and shrink the term by 132x (mmlu) to
-            # 2528x (gov_report), silently weighting domains by their prompt
-            # length. Per head the heads are then *averaged*, not summed, so the
-            # term keeps the magnitude the head-averaged student was tuned at
-            # and --lr carries over unchanged.
-            kl = F.kl_div(F.log_softmax(pred, -1), tgt / tgt.sum(-1, keepdim=True),
-                          reduction="none").sum(-1)
-            loss = args.lambda_list * kl.mean()
+            rows_t, rows_p = rows_t[usable], rows_p[usable]
+            # listwise: KL against the normalised label distribution. reduction has to
+            # be "sum" — pred is 1-D, so "batchmean" would divide the KL by the
+            # candidate count and shrink the term by 132x (mmlu) to 2528x
+            # (gov_report), silently weighting domains by their prompt length.
+            # Summing over heads as well keeps each head's term the size it
+            # would have been on its own.
+            loss = args.lambda_list * F.kl_div(
+                F.log_softmax(rows_p, -1),
+                rows_t / rows_t.sum(-1, keepdim=True), reduction="sum")
             # pairwise: random pairs anywhere in the range, to fix the ordering.
-            # The draw indexes the candidate axis, so every head is ranked
-            # against the same pairs and the mean spans heads and pairs alike.
-            C = tgt.shape[-1]
-            i = torch.randint(0, C, (args.pairs,), device=device)
-            j = torch.randint(0, C, (args.pairs,), device=device)
-            sign = torch.sign(tgt[..., i] - tgt[..., j])
+            # The same pair indices go to every head; the labels differ per head,
+            # so the constraint each head gets is its own.
+            i = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            j = torch.randint(0, rows_t.shape[-1], (args.pairs,), device=device)
+            sign = torch.sign(rows_t[..., i] - rows_t[..., j])
             keep = sign != 0
             if keep.any():
-                margin = pred[..., i] - pred[..., j]
-                loss = loss + F.softplus(-sign[keep] * margin[keep]).mean()
+                diff = rows_p[..., i] - rows_p[..., j]
+                loss = loss + F.softplus(-sign[keep] * diff[keep]).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
             total += float(loss.detach())
-            recalls.append(recall_grid(pred.detach(), tgt))
-            # Whether the head axis is earning its 4x: the heads' own overlap,
-            # against the same figure for the label they are fit to.
-            agreement = head_agreement(pred.detach())
+            recalls.append(recall_grid(rows_p.detach(), rows_t))
+            # Whether the head axis is earning its storage: how much the heads'
+            # own kept sets overlap, against the same figure for the label they
+            # are fit to. At 1.0 every head ranked the candidates alike and the
+            # axis bought nothing.
+            agreement = head_agreement(rows_p.detach())
             if agreement is not None:
                 agreements.append(agreement)
-                label_agreements.append(head_agreement(tgt))
+                label_agreements.append(head_agreement(rows_t))
         return (total / max(1, L), sum(recalls) / max(1, len(recalls)),
                 sum(agreements) / len(agreements) if agreements else None,
                 sum(label_agreements) / len(label_agreements) if label_agreements else None)
 
-    best, run_started = -1.0, time.time()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         student.train(); random.shuffle(train_shards)
         started, losses = time.time(), []
         for n, (_, path) in enumerate(train_shards):
@@ -363,6 +412,25 @@ def main():
         print(f"epoch {epoch}: loss {sum(losses)/len(losses):.4f} | "
               f"val recall macro {score:.4f} [{detail}]{head_line} | "
               f"{(time.time()-started)/60:.1f}min", flush=True)
+        # Keep an independently loadable checkpoint for every completed epoch.
+        # The optimizer state and epoch number make --resume deterministic after
+        # an interruption; checkpoint-best remains the deployment convenience.
+        epoch_dir = out_dir / f"checkpoint-epoch-{epoch:02d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({k: v.cpu() for k, v in student.state_dict().items()},
+                   epoch_dir / "pytorch_model.bin")
+        torch.save(opt.state_dict(), epoch_dir / "optimizer.pt")
+        if decoding is not None:
+            with open(epoch_dir / "decoding.json", "w") as fh:
+                json.dump(decoding, fh, indent=2)
+        json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
+                   "mlp_dim": args.mlp_dim, "heads": ["score"],
+                   "attn_heads": attn_heads},
+                  open(epoch_dir / "config.json", "w"))
+        json.dump({"epoch": epoch, "val_recall": score,
+                   "val_recall_per_dataset": means},
+                  open(epoch_dir / "trainer_state.json", "w"), indent=2)
+        print(f"  saved epoch checkpoint -> {epoch_dir}", flush=True)
         if score > best:
             best = score
             ckpt = out_dir / "checkpoint-best"
@@ -373,7 +441,8 @@ def main():
             torch.save({k: v.cpu() for k, v in student.state_dict().items()},
                        ckpt / "pytorch_model.bin")
             json.dump({"layer_count": L, "hidden_dim": H, "proj_dim": args.proj_dim,
-                       "mlp_dim": args.mlp_dim, "heads": ["score"], "kv_heads": K},
+                       "mlp_dim": args.mlp_dim, "heads": ["score"],
+                       "attn_heads": attn_heads},
                       open(ckpt / "config.json", "w"))
             json.dump({"blk": student.block_proj_norms()},
                       open(out_dir / "block_proj_norms.json", "w"), indent=2)

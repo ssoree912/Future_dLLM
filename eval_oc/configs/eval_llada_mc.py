@@ -28,7 +28,7 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLEvalTask, OpenICLInferTask
 
 with read_base():
-    from opencompass.configs.datasets.ARC_c.ARC_c_gen import ARC_c_datasets
+    from ..datasets.ARC_c.ARC_c_gen_test import ARC_c_datasets
     from opencompass.configs.datasets.piqa.piqa_gen import piqa_datasets
 
     from ..datasets.gpqa.gpqa_gen_5shot import gpqa_datasets

@@ -1,0 +1,14 @@
+"""dream-dllmcache alone: one model row per invocation.
+
+OpenCompass's --debug keeps tasks in-process and never releases a loaded model,
+so a config with two rows holds two checkpoints at once and the second one OOMs.
+Splitting the rows is what keeps a run inside one card.
+"""
+from mmengine.config import read_base
+
+with read_base():
+    from .eval_dream_cache_methods import datasets, eval, infer, models
+
+models = [m for m in models if m['abbr'] == 'dream-dllmcache']
+
+work_dir = 'outputs/oc_dream_dllmcache'

@@ -77,7 +77,7 @@ def main():
 
     student = PromptUtilityStudent(StudentConfig(
         layer_count=layers, hidden_dim=hidden, proj_dim=proj_dim,
-        mlp_dim=mlp_dim, heads=("score",), kv_heads=kv_heads)).to(device).float().eval()
+        mlp_dim=mlp_dim, heads=("score",), attn_heads=kv_heads)).to(device).float().eval()
     weights_mib = (torch.cuda.memory_allocated() - before) / 2**20
     params = sum(p.numel() for p in student.parameters())
 
