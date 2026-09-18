@@ -39,6 +39,12 @@ read -r -a LIMITS <<< "${LIMITS:-500 371 150 100 500}"
 # finest granularity eviction can act on. 4x the storage, hence its own root.
 PER_HEAD_ARGS=()
 [ -n "${PER_HEAD:-}" ] && PER_HEAD_ARGS=(--per-head)
+# How the block's rows, and the query heads sharing a KV entry, are folded into
+# the label. max is what the label shipped with; mean is the alternative the
+# row/group diagnostic argues for. Each writes its own teacher_kind, so the
+# resume check refuses to mix them in one root.
+REDUCE_ARGS=(--label-row-reduce "${LABEL_ROW_REDUCE:-max}"
+             --label-group-reduce "${LABEL_GROUP_REDUCE:-max}")
 
 export FUTURE_DLLM_DATA="$DATA_ROOT"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -48,9 +54,10 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$(dirname "$LOG_FILE")" "$PROMPT_ROOT" "$TEACHER_ROOT"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-printf 'default teacher extraction (dream)\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nmax_seq_len=%s\nper_head=%s\ndatasets=%s\nlimits=%s\ngpu=%s\nlog=%s\n' \
+printf 'default teacher extraction (dream)\nmodel=%s\ndata=%s\nprompts=%s\nteacher=%s\nmax_seq_len=%s\nper_head=%s\nreduce=row:%s group:%s\ndatasets=%s\nlimits=%s\ngpu=%s\nlog=%s\n' \
   "$MODEL" "$DATA_ROOT" "$PROMPT_ROOT" "$TEACHER_ROOT" "$MAX_SEQ_LEN" \
-  "${PER_HEAD:-0}" "${DATASETS[*]}" "${LIMITS[*]}" \
+  "${PER_HEAD:-0}" "${LABEL_ROW_REDUCE:-max}" "${LABEL_GROUP_REDUCE:-max}" \
+  "${DATASETS[*]}" "${LIMITS[*]}" \
   "$CUDA_VISIBLE_DEVICES" "$LOG_FILE"
 
 for index in "${!DATASETS[@]}"; do
@@ -75,7 +82,7 @@ for index in "${!DATASETS[@]}"; do
     --shard-root "$PROMPT_ROOT" \
     --output-root "$TEACHER_ROOT" \
     --seed "$DREAM_SEED" "${DREAM_ARGS[@]}" \
-    "${PER_HEAD_ARGS[@]}"
+    "${PER_HEAD_ARGS[@]}" "${REDUCE_ARGS[@]}"
 done
 
 echo "default teacher extraction (dream) complete"

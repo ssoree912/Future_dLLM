@@ -66,6 +66,18 @@ def parse_args(family, description):
     p.add_argument("--max-prompt-len", type=int, default=None,
                    help="optional stricter prompt-only cap")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--label-row-reduce", choices=("max", "mean"), default="max",
+                   help="how the block's rows become one number per candidate. "
+                        "max is what the label shipped with: a candidate "
+                        "survives if any finished token needed it")
+    p.add_argument("--label-group-reduce", choices=("max", "mean"), default="max",
+                   help="how the query heads sharing a KV entry are folded, on "
+                        "a GQA backend. Ignored when --per-head is off")
+    p.add_argument("--save-query-head-rows", action="store_true",
+                   help="with --save-attention-rows and --per-head, also store "
+                        "the rows before the query-head group is folded, so the "
+                        "group reduction can be studied offline. 7x the row "
+                        "storage on Dream; analysis only, the label is unchanged")
     p.add_argument("--per-head", action="store_true",
                    help="label every attention head separately instead of "
                         "averaging them. Needed for per-head eviction, where "
@@ -181,21 +193,23 @@ def collect(model, prompt_ids, args, backend):
         # One more forward on the completed block: all rows are real tokens now.
         cache.capture_rows = True
         cache.capture_per_head = bool(getattr(args, "per_head", False))
+        cache.group_reduce = getattr(args, "label_group_reduce", "max")
         step(S - 1)
         save_attention_rows = getattr(args, "save_attention_rows", False)
         # Per head the rows arrive as [heads, block rows, candidates], so the
         # max that turns rows into a label moves one axis right and the result
         # keeps its head axis: [layers, heads, candidates].
         row_axis = 1 if cache.capture_per_head else 0
+        row_reduce = getattr(args, "label_row_reduce", "max")
         if save_attention_rows:
             future_attention_rows = torch.stack(
                 [cache.pending_rows[l].clone() for l in range(L)]
             )
-            label = future_attention_rows.max(dim=row_axis + 1).values
+            label = reduce_rows(future_attention_rows, row_axis + 1, row_reduce)
         else:
             # Keep the ordinary teacher path at its original memory footprint.
             label = torch.stack([
-                cache.pending_rows[layer].max(dim=row_axis).values
+                reduce_rows(cache.pending_rows[layer], row_axis, row_reduce)
                 for layer in range(L)
             ])
         cache.pending_rows.clear()
@@ -236,6 +250,25 @@ def collect(model, prompt_ids, args, backend):
 
 
 @torch.no_grad()
+def reduce_rows(rows: torch.Tensor, axis: int, how: str) -> torch.Tensor:
+    """Turn the block's rows into one number per candidate.
+
+    ``max`` is what the label shipped with -- a candidate survives if any
+    finished token needed it strongly -- and the argument for it is that a
+    position one row depended on is erased by a mean. Measured over four blocks
+    that is not what happens: the worst row keeps the same share of its own
+    attention under either rule (within 0.01), while max retains ~2 points less
+    total mass and leaves a visibly flatter label, which is what the student is
+    then fit to. Both are selectable so the claim can be tested rather than
+    argued.
+    """
+    if how == "max":
+        return rows.max(dim=axis).values
+    if how == "mean":
+        return rows.mean(dim=axis)
+    raise ValueError(f"unknown row reduction: {how}")
+
+
 def collect_dream(model, prompt_ids, args, backend):
     """Use the deployment decoder; observing completed attention consumes no RNG."""
     from future_dllm.dream_decoding import DreamDecoding
@@ -246,11 +279,15 @@ def collect_dream(model, prompt_ids, args, backend):
     records = []
 
     per_head = bool(getattr(args, "per_head", False))
+    row_reduce = getattr(args, "label_row_reduce", "max")
+    group_reduce = getattr(args, "label_group_reduce", "max")
 
     def completed(x, cache, block_index, bs, selection_input):
         be = bs + args.block_length
         cache.capture_rows = True
         cache.capture_per_head = per_head
+        cache.group_reduce = group_reduce
+        cache.capture_query_heads = bool(getattr(args, "save_query_head_rows", False))
         model(input_ids=x[:, bs:be], position_offset=bs, cache_state=2,
               customcache=cache, attention_mask="full")
         cache.capture_rows = False
@@ -259,7 +296,7 @@ def collect_dream(model, prompt_ids, args, backend):
         # max that turns rows into a label moves one axis right and the head
         # axis survives it: [layers, kv heads, candidates].
         row_axis = 1 if per_head else 0
-        label = torch.stack([row.max(dim=row_axis).values for row in rows])
+        label = torch.stack([reduce_rows(row, row_axis, row_reduce) for row in rows])
         candidates = torch.cat([torch.arange(bs), torch.arange(be, x.shape[1])])
         record = {
             "block_index": block_index, "block_start": bs,
@@ -276,7 +313,12 @@ def collect_dream(model, prompt_ids, args, backend):
         }
         if args.save_attention_rows:
             record["future_attention_rows"] = torch.stack(rows).to(torch.float16).cpu()
+            if cache.pending_query_rows:
+                record["future_attention_rows_query"] = torch.stack(
+                    [cache.pending_query_rows[l] for l in range(backend.n_layers)]
+                ).to(torch.float16).cpu()
         cache.pending_rows.clear()
+        cache.pending_query_rows.clear()
         records.append(record)
 
     generate(model, prompt, gen_length=args.gen_length, block_length=args.block_length,
@@ -311,7 +353,11 @@ def run(family, description):
         print(f"decoding={decoding} seed={args.seed}", flush=True)
 
     per_head = bool(getattr(args, "per_head", False))
-    teacher_kind = "final_rowmax_per_head" if per_head else "final_rowmax"
+    row_reduce = getattr(args, "label_row_reduce", "max")
+    group_reduce = getattr(args, "label_group_reduce", "max")
+    teacher_kind = f"final_row{row_reduce}" + ("_per_head" if per_head else "")
+    if per_head and group_reduce != "max":
+        teacher_kind += f"_group{group_reduce}"
 
     out = Path(args.output_root) / args.dataset
     out.mkdir(parents=True, exist_ok=True)
@@ -385,7 +431,7 @@ def run(family, description):
             # student reading these shards knows what its scores index.
             payload.update(
                 per_head_axis="kv_heads",
-                per_head_group_reduce="max",
+                per_head_group_reduce=group_reduce,
                 num_label_heads=int(records[0]["label_final_rowmax"].shape[1]),
             )
         if decoding is not None:

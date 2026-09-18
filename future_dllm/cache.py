@@ -136,7 +136,20 @@ class CustomCache:
         # one kept set. Keeping the axis is the only change the label needs for
         # per-head eviction; it costs H times the storage, so it is opt-in.
         self.capture_per_head = False
+        # Analysis only: also keep the rows *before* the query-head group is
+        # folded, so the group reduction itself can be studied offline. The
+        # label path is untouched -- pending_rows still carries the folded
+        # version -- because this axis is 7x the storage on Dream and is not
+        # something eviction can act on.
+        self.capture_query_heads = False
+        # How the query heads sharing a KV entry are folded. "max" is what the
+        # label shipped with -- the entry has to serve the most demanding head.
+        # Measured on four blocks that argument does not hold: max protects the
+        # worst head no better than mean (within 0.01, sometimes worse) while
+        # retaining ~1 point less attention mass and leaving a flatter label.
+        self.group_reduce = "max"
         self.pending_rows = {}
+        self.pending_query_rows = {}
         self.row_mask = None
 
         # Optional: append one jsonl line per selection recording *where* the
@@ -172,6 +185,9 @@ class CustomCache:
         weights = torch.softmax(scores, dim=-1)
         n_cand = k.size(-2) - q.size(-2)
         rows = weights[..., :n_cand]
+        if self.capture_per_head and self.capture_query_heads and group != 1:
+            self.pending_query_rows[layer_id] = self._natural_order(
+                layer_id, rows.squeeze(0))
         if self.capture_per_head:
             if group != 1:
                 # Each query head needs its own softmax -- the distribution is
@@ -180,16 +196,21 @@ class CustomCache:
                 # keeps must serve the most demanding query head reading it,
                 # which is the argument the row max already makes one axis over.
                 batch, _, n_rows, n_cols = rows.shape
-                rows = rows.view(batch, kv_heads, group, n_rows, n_cols).amax(dim=2)
+                grouped = rows.view(batch, kv_heads, group, n_rows, n_cols)
+                rows = (grouped.amax(dim=2) if self.group_reduce == "max"
+                        else grouped.mean(dim=2))
             rows = rows.squeeze(0)
         else:
             rows = rows.mean(dim=1).squeeze(0)
-        if layer_id in self.candidate_order:
-            # Decode in score order, but keep teacher columns in natural order.
-            natural_rows = torch.empty_like(rows)
-            natural_rows[..., self.candidate_order[layer_id]] = rows
-            rows = natural_rows
-        self.pending_rows[layer_id] = rows
+        self.pending_rows[layer_id] = self._natural_order(layer_id, rows)
+
+    def _natural_order(self, layer_id: int, rows: torch.Tensor) -> torch.Tensor:
+        """Decode in score order, but keep teacher columns in natural order."""
+        if layer_id not in self.candidate_order:
+            return rows
+        natural_rows = torch.empty_like(rows)
+        natural_rows[..., self.candidate_order[layer_id]] = rows
+        return natural_rows
 
     def capture_layer_hidden_states(self, layer_id: int, hidden_states: torch.Tensor) -> None:
         if self.cache_scorer is not None:
