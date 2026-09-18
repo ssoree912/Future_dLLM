@@ -83,6 +83,9 @@ class FutureDLLM(HFLM):
         nll_type: str = "mc",
         log_type: str = "ftb",
         eviction_method: str = "student",
+        oracle_row_reduce: str = "max",
+        oracle_group_reduce: str = "max",
+        oracle_per_head: bool = True,
         eviction_accum: str = "none",
         eviction_accum_decay: float = 1.0,
         dream_alg: str = "entropy",
@@ -130,8 +133,21 @@ class FutureDLLM(HFLM):
             str(pretrained), max_seq_len=self._max_seq_len,
             block_length=self._block_len, keep_ratio=self._keep_ratio)
         self._backend = backend
-        if eviction_method not in ("student", "sparse"):
-            raise ValueError("eviction_method must be student or sparse")
+        if eviction_method not in ("student", "sparse", "oracle"):
+            raise ValueError("eviction_method must be student, sparse or oracle")
+        # The oracle evicts with the label of the block it is decoding, so the
+        # row measures what the label can do before asking whether a scorer can
+        # predict it. Which label: the two reductions are the same knobs the
+        # extractor takes, and they have to be stated here or the two arms of a
+        # max-against-mean comparison are indistinguishable on disk.
+        self._oracle_reduce = None
+        if eviction_method == "oracle":
+            for name, value in (("oracle_row_reduce", oracle_row_reduce),
+                                ("oracle_group_reduce", oracle_group_reduce)):
+                if value not in ("max", "mean"):
+                    raise ValueError(f"{name} must be max or mean, got {value!r}")
+            self._oracle_reduce = (oracle_row_reduce, oracle_group_reduce,
+                                   bool(oracle_per_head))
         if eviction_accum not in ("none", "across_blocks"):
             raise ValueError("eviction_accum must be none or across_blocks")
         self._eviction_method = eviction_method
@@ -178,6 +194,9 @@ class FutureDLLM(HFLM):
                 "rerun rather than evaluate on CPU")
 
         self._scorer = None
+        if eviction_method == "oracle" and float(keep_ratio) >= 1.0:
+            raise ValueError("oracle eviction needs keep_ratio < 1; at 1.0 "
+                             "nothing is evicted and the row is the full cache")
         if student_path and eviction_method == "student":
             if self._dream_decoding is not None and self._keep_ratio < 1:
                 from future_dllm.dream_decoding import require_matching_decoding
@@ -203,6 +222,10 @@ class FutureDLLM(HFLM):
         # baseline row gets mistaken for a full-cache one.
         if float(keep_ratio) >= 1.0:
             eviction = "none (keep_ratio=1.0)"
+        elif eviction_method == "oracle":
+            eviction = (f"oracle (label of the decoding block, "
+                        f"row={oracle_row_reduce} group={oracle_group_reduce}, "
+                        f"{'per head' if oracle_per_head else 'head-averaged'})")
         elif eviction_method == "sparse":
             eviction = "sparse (baseline attention score, no checkpoint)"
         else:
@@ -431,6 +454,7 @@ class FutureDLLM(HFLM):
                     self.model, context_enc.to(self.device), gen_length=gen_length,
                     block_length=self._block_len, mask_id=self._mask_id,
                     cache_scorer=self._scorer, eviction_method=self._eviction_method,
+                    oracle_reduce=self._oracle_reduce,
                     **self._dream_decoding.generation_kwargs(gen_length))
         return self._generate(
             self.model, context_enc.to(self.device),

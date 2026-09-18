@@ -102,8 +102,8 @@ class CustomCache:
         accum_state: Optional[dict] = None,
         accum_decay: float = 1.0,
     ) -> None:
-        if eviction_method not in ("student", "sparse"):
-            raise ValueError("eviction_method must be student or sparse")
+        if eviction_method not in ("student", "sparse", "oracle"):
+            raise ValueError("eviction_method must be student, sparse or oracle")
         self.cache = {}
         # Running per-layer score buffer shared across blocks, indexed by
         # absolute sequence position. The caller owns it because a cache lives
@@ -115,6 +115,11 @@ class CustomCache:
         self.candidate_order = {}
         self.keep_ratios = [keep_ratio for _ in range(n_layers)]
         self.cache_scorer = cache_scorer
+        # eviction_method="oracle": evict with the teacher label of the block
+        # being decoded instead of a trained scorer, so the row measures what
+        # the label can do without asking whether a student can learn it. The
+        # caller fills this per block, keyed by layer.
+        self.oracle_label = {}
         self.prompt_length = prompt_length
         self.generation_length = generation_length
 
@@ -259,11 +264,37 @@ class CustomCache:
             self.cache[layer_id] = {"k": keep_k, "v": keep_v}
             return
 
-        if self.cache_scorer is None:
+        if self.eviction_method == "oracle":
+            scores = self.oracle_label.get(layer_id)
+            if scores is None:
+                raise RuntimeError(f"no oracle label for layer {layer_id}")
+            # The label was built over the same complement of the block, in the
+            # same natural order filter_cache rebuilds below, so the columns
+            # line up. Asserted rather than assumed: a backend that ever widens
+            # its window would otherwise score the wrong columns silently.
+            if scores.shape[-1] != keep_k.size(-2):
+                raise RuntimeError(
+                    f"oracle label has {scores.shape[-1]} candidates but the "
+                    f"cache holds {keep_k.size(-2)} at layer {layer_id}")
+            scores = scores.float().unsqueeze(0)
+        else:
+            scores = None
+
+        if scores is None and self.cache_scorer is None:
             raise RuntimeError(
                 "future_dllm evicts with a trained scorer; pass a student "
                 "checkpoint, or run with keep_ratio=1.0 to disable eviction"
             )
+
+        if scores is not None:
+            keep_num = int(keep_k.size(-2) * self.keep_ratios[layer_id])
+            keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
+            if not self.baseline_order:
+                keep_indices = keep_indices.sort(dim=-1).values
+            head_index = torch.arange(keep_k.size(1), device=keep_k.device)[:, None]
+            self.cache[layer_id] = {"k": keep_k[:, head_index, keep_indices],
+                                    "v": keep_v[:, head_index, keep_indices]}
+            return
 
         hidden_states = self.layer_hidden_states.pop(layer_id, None)
         if hidden_states is None:

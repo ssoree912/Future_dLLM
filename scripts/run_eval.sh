@@ -67,7 +67,8 @@ case "$DATASET" in
   *) echo "unknown dataset: $DATASET" >&2; exit 1 ;;
 esac
 
-if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ] && [ "$EVICTION_METHOD" != sparse ]; then
+if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ] \
+   && [ "$EVICTION_METHOD" != sparse ] && [ "$EVICTION_METHOD" != oracle ]; then
   echo "keep_ratio=$KEEP requires a student checkpoint" >&2
   exit 2
 fi
@@ -93,6 +94,15 @@ if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
 fi
 METHOD=none
 if [ "$EVICTION_METHOD" = sparse ]; then METHOD=sparse; fi
+# The oracle's two reductions decide which label is doing the evicting, so they
+# go in the result filename: without them the max and the mean arm of the same
+# comparison land on the same path and the second silently looks like a rerun.
+if [ "$EVICTION_METHOD" = oracle ]; then
+  ORACLE_ROW="${ORACLE_ROW_REDUCE:-max}"
+  ORACLE_GROUP="${ORACLE_GROUP_REDUCE:-max}"
+  ARGS="$ARGS,oracle_row_reduce=$ORACLE_ROW,oracle_group_reduce=$ORACLE_GROUP"
+  METHOD="oracle_row${ORACLE_ROW}_group${ORACLE_GROUP}"
+fi
 if [ -n "$CKPT" ]; then
   ARGS="$ARGS,student_path=$(cd "$(dirname "$CKPT")" && pwd)/$(basename "$CKPT")"
   METHOD=$(basename "$(dirname "$CKPT")")
