@@ -23,7 +23,14 @@ PAIRS="${PAIRS:-4096}"
 MAX_SEQ_LEN=4096
 RUN_TAG="$(date +%Y%m%d_%H%M%S)"
 MAX_SHARDS="${MAX_SHARDS:-500,371,150,100,500}"
-RUN_NAME="${RUN_NAME:-default_5ds_$(echo "$MAX_SHARDS" | tr , -)_e${EPOCHS}_lr${LR}_${RUN_TAG}}"
+# Weight on the listwise KL against the pairwise term. Both terms average over
+# heads now, so this is the whole of their ratio: 1.0 weighs them equally, and
+# 32 reproduces what the pre-fix code did on LLaDA, where listwise summed over
+# its 32 KV heads while pairwise averaged. It goes in RUN_NAME because two
+# lambdas on the same teacher are the comparison, and they must not collide on
+# one checkpoint path.
+LAMBDA_LIST="${LAMBDA_LIST:-1.0}"
+RUN_NAME="${RUN_NAME:-default_5ds_$(echo "$MAX_SHARDS" | tr , -)_e${EPOCHS}_lr${LR}_lam${LAMBDA_LIST}_${RUN_TAG}}"
 LOG_FILE="${LOG_FILE:-$REPO/logs/train/train_${RUN_NAME}.log}"
 
 ROOTS=(
@@ -44,6 +51,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 printf 'default student training\nmodel=%s\nteacher=%s\nmax_seq_len=%s\nrun=%s\nlog=%s\n' \
   "$MODEL" "$TEACHER_ROOT" "$MAX_SEQ_LEN" "$RUN_NAME" "$LOG_FILE"
+echo "lambda_list=$LAMBDA_LIST"
 
 "$PY" "$REPO/student/train_student.py" \
   --model "$MODEL" \
@@ -56,6 +64,7 @@ printf 'default student training\nmodel=%s\nteacher=%s\nmax_seq_len=%s\nrun=%s\n
   --proj-dim "$PROJ_DIM" \
   --mlp-dim "$MLP_DIM" \
   --pairs "$PAIRS" \
+  --lambda-list "$LAMBDA_LIST" \
   --max-seq-len "$MAX_SEQ_LEN" \
   --name "$RUN_NAME"
 

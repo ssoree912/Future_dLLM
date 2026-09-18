@@ -211,7 +211,11 @@ def main():
                 f"{backend.name} checkpoint. Pass the model the labels came from."
             )
         kinds.add(head.get("teacher_kind", "final_rowmax"))
-        label_heads.add(int(head.get("num_label_heads", 1)))
+        # Shards written before this header field existed simply omit it;
+        # defaulting those to 1 would call a per-head root head-averaged. Leave
+        # them out and let the label tensor itself settle the count below.
+        if "num_label_heads" in head:
+            label_heads.add(int(head["num_label_heads"]))
         split = max(1, int(len(found) * args.val_ratio))
         val_shards += [(name, p) for p in found[:split]]
         train_shards += [(name, p) for p in found[split:]]
@@ -224,18 +228,16 @@ def main():
     # A per-head root and a head-averaged one train different students, and
     # mixing them would silently broadcast one label rank against the other, so
     # the roots have to agree before anything is built.
-    if len(kinds) != 1 or len(label_heads) != 1:
+    if len(kinds) != 1 or len(label_heads) > 1:
         raise SystemExit(f"teacher roots disagree on the label: kinds={sorted(kinds)} "
                          f"heads={sorted(label_heads)}; train one kind at a time")
-    teacher_kind, K = sorted(kinds)[0], sorted(label_heads)[0]
+    teacher_kind = sorted(kinds)[0]
     # Containment, not a suffix: the kind also records the group reduction
     # when it is not the default, so "final_rowmean_per_head_groupmean"
     # is per-head too.
     per_head = "_per_head" in teacher_kind
-    if per_head != (K > 1):
-        raise SystemExit(f"teacher_kind={teacher_kind} but num_label_heads={K}")
-    print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
-          f"{' (per KV head)' if per_head else ' (head-averaged)'}", flush=True)
+    # None when no shard declares it; the probe below fills it in.
+    K = sorted(label_heads)[0] if label_heads else None
 
     counts = [sum(1 for n, _ in train_shards + val_shards if n == d) for d in datasets]
     out_dir = Path(args.output_dir) if args.output_dir else (
@@ -250,9 +252,16 @@ def main():
     probe = load_shard(train_shards[0][1])["blocks"][0]["label_final_rowmax"]
     attn_heads = int(probe.shape[1]) if probe.dim() == 3 else 1
     print(f"teacher labels: {tuple(probe.shape)} -> attn_heads={attn_heads}", flush=True)
-    if attn_heads != K:
+    if K is None:
+        K = attn_heads
+    elif attn_heads != K:
         raise SystemExit(f"shard metadata says {K} label heads but the label "
                          f"tensor has {attn_heads}; the root is inconsistent")
+    if per_head != (K > 1):
+        raise SystemExit(f"teacher_kind={teacher_kind} but the label carries "
+                         f"{K} head(s)")
+    print(f"teacher_kind={teacher_kind} scorer emits {K} score(s) per candidate"
+          f"{' (per KV head)' if per_head else ' (head-averaged)'}", flush=True)
     # The label's head axis is the cache's KV head axis, so a scorer wider or
     # narrower than the backbone's KV heads emits a kept set the cache cannot be
     # indexed with -- the one mismatch here that still yields a loadable
