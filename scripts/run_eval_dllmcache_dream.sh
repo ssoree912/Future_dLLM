@@ -30,6 +30,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 UNSAFE_TASK=0
+CHAT_TASK=0
 PROMPT_INT=25
 GEN_INT=2
 case "$DATASET" in
@@ -42,6 +43,7 @@ case "$DATASET" in
   math)       TASK=local_math;      SHOTS=""; LEN=256; PROMPT_INT=50; GEN_INT=1 ;;
   math500)    TASK=local_math500;   SHOTS=""; LEN=256; PROMPT_INT=50; GEN_INT=1 ;;
   humaneval)  TASK=local_humaneval; SHOTS=""; LEN=512; PROMPT_INT=50; GEN_INT=1; UNSAFE_TASK=1 ;;
+  mbpp)      TASK=local_mbpp;     SHOTS="--num_fewshot 3"; LEN=512; PROMPT_INT=10; GEN_INT=8; UNSAFE_TASK=1; CHAT_TASK=1 ;;
   mmlu|arc_c|piqa|gpqa)
     echo "$DATASET is multiple choice; Dream's diffusion loglikelihood is not usable here" >&2
     exit 1 ;;
@@ -109,6 +111,11 @@ if [ -n "${LIMIT:-}" ]; then
 fi
 if [ "${LOG_SAMPLES:-1}" != "0" ]; then
   EXTRA_ARGS+=(--log_samples)
+fi
+if [ "$CHAT_TASK" -eq 1 ]; then
+  # dLLM-cache runs MBPP as `--tasks mbpp --num_fewshot 3 --apply_chat_template`,
+  # so this one task takes the template even though the rest of the suite does not.
+  EXTRA_ARGS+=(--apply_chat_template)
 fi
 if [ "$UNSAFE_TASK" -eq 1 ]; then
   export HF_ALLOW_CODE_EVAL=1

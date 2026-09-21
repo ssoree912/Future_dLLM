@@ -11,7 +11,7 @@
 # diffusion loglikelihood returns near-chance numbers through lm-eval.
 #
 # Env: LIMIT, GEN_LENGTH, STEPS, MAX_SEQ_LEN, MAX_PROMPT_LEN, LOG_SAMPLES=0,
-#      CHAT_TEMPLATE, ADD_BOS, CUDA_VISIBLE_DEVICES.
+#      CHAT_TEMPLATE, ADD_BOS, TEMPERATURE, TOP_P, CUDA_VISIBLE_DEVICES.
 set -euo pipefail
 
 DATASET="${1:?usage: run_eval_fastdllm_dream.sh <dataset> [method]}"
@@ -29,6 +29,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 UNSAFE_TASK=0
+CHAT_TASK=0
 PROMPT_INT=25
 GEN_INT=2
 case "$DATASET" in
@@ -41,6 +42,7 @@ case "$DATASET" in
   math)       TASK=local_math;      SHOTS=""; LEN=256; PROMPT_INT=50; GEN_INT=1 ;;
   math500)    TASK=local_math500;   SHOTS=""; LEN=256; PROMPT_INT=50; GEN_INT=1 ;;
   humaneval)  TASK=local_humaneval; SHOTS=""; LEN=512; PROMPT_INT=50; GEN_INT=1; UNSAFE_TASK=1 ;;
+  mbpp)      TASK=local_mbpp;     SHOTS="--num_fewshot 3"; LEN=512; UNSAFE_TASK=1; CHAT_TASK=1 ;;
   mmlu|arc_c|piqa|gpqa)
     echo "$DATASET is multiple choice; Dream's diffusion loglikelihood is not usable here" >&2
     exit 1 ;;
@@ -71,6 +73,10 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 ARGS="pretrained=$MODEL,max_new_tokens=$GEN_LENGTH,diffusion_steps=$STEPS"
 ARGS="$ARGS,block_length=$BLOCK_LENGTH,max_seq_len=$MAX_SEQ_LEN"
 ARGS="$ARGS,use_cache=$USE_CACHE,dual_cache=$DUAL,alg=$ALG,threshold=${THRESHOLD:-0.9}"
+# Fast-dLLM leaves Dream at eval.py's default of 0.0; TEMPERATURE/TOP_P
+# override it, e.g. to read this row at Dream's own recommended sampling.
+ARGS="$ARGS,temperature=${TEMPERATURE:-0.0}"
+if [ -n "${TOP_P:-}" ]; then ARGS="$ARGS,top_p=$TOP_P"; fi
 ARGS="$ARGS,chat_template=${CHAT_TEMPLATE:-False},add_bos_token=${ADD_BOS:-True}"
 if [ -n "${MAX_PROMPT_LEN:-}" ]; then
   ARGS="$ARGS,max_prompt_len=$MAX_PROMPT_LEN"
@@ -111,6 +117,11 @@ if [ -n "${LIMIT:-}" ]; then
 fi
 if [ "${LOG_SAMPLES:-1}" != "0" ]; then
   EXTRA_ARGS+=(--log_samples)
+fi
+if [ "$CHAT_TASK" -eq 1 ]; then
+  # dLLM-cache runs MBPP as `--tasks mbpp --num_fewshot 3 --apply_chat_template`,
+  # so this one task takes the template even though the rest of the suite does not.
+  EXTRA_ARGS+=(--apply_chat_template)
 fi
 if [ "$UNSAFE_TASK" -eq 1 ]; then
   export HF_ALLOW_CODE_EVAL=1
