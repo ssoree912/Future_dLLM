@@ -177,5 +177,12 @@ if [ "${#RESULT_FILES[@]}" -ne 1 ]; then
 fi
 mv "${RESULT_FILES[0]}" "$RESULT"
 rm -rf "$TMP"
-rm -f "$FUTURE_DLLM_RESUME"
+# The store is scratch for resuming, so a finished run drops it -- unless the
+# caller wants the generations it holds (scripts/origin_drift.py joins arms on
+# them, and nothing else on disk carries the decoded text).
+if [ -n "${KEEP_RESUME:-}" ]; then
+  echo "kept resume store: $FUTURE_DLLM_RESUME"
+else
+  rm -f "$FUTURE_DLLM_RESUME"
+fi
 echo "wrote $RESULT"
