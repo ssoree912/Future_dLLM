@@ -38,7 +38,8 @@ def get_num_transfer_tokens(mask_index, steps):
 def generate(model, prompt, steps=128, gen_length=128, block_length=32,
              temperature=0., cfg_scale=0., remasking='low_confidence',
              mask_id=MASK_ID, cache_scorer=None, *, eviction_method="student",
-             eviction_accum="none", eviction_accum_decay=1.0, oracle_reduce=None):
+             eviction_accum="none", eviction_accum_decay=1.0, oracle_reduce=None,
+             current_reduce=None):
     """Generate ``gen_length`` tokens block by block.
 
     ``cache_scorer`` is a trained ``PromptUtilityStudent``; without one the model
@@ -56,10 +57,12 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
     weights the carried history: 1.0 is a plain running sum, 0.0 reproduces the
     per-block default. The state lives here because a cache lasts one block.
     """
-    if eviction_method not in ("student", "sparse", "oracle"):
-        raise ValueError("eviction_method must be student, sparse or oracle")
+    if eviction_method not in ("student", "current", "sparse", "oracle"):
+        raise ValueError("eviction_method must be student, current, sparse or oracle")
     if (oracle_reduce is not None) != (eviction_method == "oracle"):
         raise ValueError("oracle_reduce and eviction_method='oracle' go together")
+    if (current_reduce is not None) != (eviction_method == "current"):
+        raise ValueError("current_reduce and eviction_method='current' go together")
     if eviction_accum not in ("none", "across_blocks"):
         raise ValueError("eviction_accum must be none or across_blocks")
     accum_state = {} if eviction_accum == "across_blocks" else None
@@ -127,7 +130,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=32,
                 keep_ratio=model.config.keep_ratio,
                 cache_scorer=cache_scorer, prompt_length=prompt_len,
                 generation_length=gen_length,
-                eviction_method=eviction_method, baseline_order=True,
+                eviction_method=eviction_method, current_reduce=current_reduce,
+                baseline_order=True,
                 accum_state=accum_state, accum_decay=eviction_accum_decay)
             step_block(cache)
         else:

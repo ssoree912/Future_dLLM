@@ -12,6 +12,7 @@
 #   scripts/run_eval.sh gsm8k  1.0
 #   scripts/run_eval.sh bbh    0.1 artifacts/ckpts/<run>/checkpoint-best
 #   LIMIT=200 scripts/run_eval.sh math 0.1 artifacts/ckpts/<run>/checkpoint-best
+#   LOG_SAMPLES=1 scripts/run_eval.sh gsm8k 1.0
 #   FUTURE_DLLM_MODEL=$PWD/model/Dream-v0-Instruct-7B scripts/run_eval.sh gsm8k 0.1 <ckpt>
 set -euo pipefail
 
@@ -68,6 +69,7 @@ case "$DATASET" in
 esac
 
 if [[ ! "$KEEP" =~ ^1([.]0+)?$ ]] && [ -z "$CKPT" ] \
+   && [ "$EVICTION_METHOD" != current ] \
    && [ "$EVICTION_METHOD" != sparse ] && [ "$EVICTION_METHOD" != oracle ]; then
   echo "keep_ratio=$KEEP requires a student checkpoint" >&2
   exit 2
@@ -94,6 +96,13 @@ if [ "$LIKELIHOOD_TASK" -eq 1 ]; then
 fi
 METHOD=none
 if [ "$EVICTION_METHOD" = sparse ]; then METHOD=sparse; fi
+if [ "$EVICTION_METHOD" = current ]; then
+  CURRENT_ROW="${CURRENT_ROW_REDUCE:-max}"
+  CURRENT_GROUP="${CURRENT_GROUP_REDUCE:-mean}"
+  CURRENT_PER_HEAD="${CURRENT_PER_HEAD:-True}"
+  ARGS="$ARGS,current_row_reduce=$CURRENT_ROW,current_group_reduce=$CURRENT_GROUP,current_per_head=$CURRENT_PER_HEAD"
+  METHOD="current_row${CURRENT_ROW}_group${CURRENT_GROUP}_perhead${CURRENT_PER_HEAD}"
+fi
 # The oracle's two reductions decide which label is doing the evicting, so they
 # go in the result filename: without them the max and the mean arm of the same
 # comparison land on the same path and the second silently looks like a rerun.
@@ -132,7 +141,7 @@ export FUTURE_DLLM_RESUME="$REPO/results/.resume/${MODEL_TAG}_${DATASET}_keep${K
 mkdir -p "$(dirname "$FUTURE_DLLM_RESUME")"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 # Every task reads local files, so nothing here needs the Hub. datasets still rewrites those
 # parquet files as arrow the first time it reads them; pin that cache inside the repo so a run
 # never writes to a shared or home-directory cache. Deleting it only costs one re-read.
@@ -157,6 +166,9 @@ if [ "$UNSAFE_TASK" -eq 1 ]; then
   export HF_ALLOW_CODE_EVAL=1
   EXTRA_ARGS+=(--confirm_run_unsafe_code)
 fi
+if [ "${LOG_SAMPLES:-0}" != "0" ]; then
+  EXTRA_ARGS+=(--log_samples)
+fi
 
 echo "$DATASET keep=$KEEP max_seq_len=$MAX_SEQ_LEN samples=${LIMIT:-all} -> $RESULT"
 cd "$REPO"
@@ -176,6 +188,19 @@ if [ "${#RESULT_FILES[@]}" -ne 1 ]; then
   exit 1
 fi
 mv "${RESULT_FILES[0]}" "$RESULT"
+if [ "${LOG_SAMPLES:-0}" != "0" ]; then
+  mapfile -d '' -t SAMPLE_FILES < <(find "$TMP/out" -name 'samples_*.jsonl' -print0)
+  if [ "${#SAMPLE_FILES[@]}" -lt 1 ]; then
+    echo "--log_samples produced no samples under $TMP/out" >&2
+    exit 1
+  fi
+  SAMPLE_DIR="${RESULT%.json}_samples"
+  mkdir -p "$SAMPLE_DIR"
+  for sample in "${SAMPLE_FILES[@]}"; do
+    mv "$sample" "$SAMPLE_DIR/"
+  done
+  echo "samples -> $SAMPLE_DIR"
+fi
 rm -rf "$TMP"
 # The store is scratch for resuming, so a finished run drops it -- unless the
 # caller wants the generations it holds (scripts/origin_drift.py joins arms on

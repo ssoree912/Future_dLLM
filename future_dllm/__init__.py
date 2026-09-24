@@ -11,7 +11,8 @@ scorer (``student_cache.PromptUtilityStudent``):
 ``backends.load_model`` picks between them from the checkpoint's ``model_type``,
 so the teacher and student scripts never branch on the family themselves.
 """
-from .cache import CustomCache, sparse_dllm_current_score
+from .cache import (CustomCache, sparse_dllm_current_score,
+                    teacher_current_attention_score)
 from .modeling_llada import LLaDAModelLM
 from .llada_generate import generate, add_gumbel_noise, get_num_transfer_tokens
 from .student_cache import (PromptUtilityStudent, StudentConfig,
@@ -21,4 +22,5 @@ from .backends import Backend, detect_family, load_model
 __all__ = ["LLaDAModelLM", "CustomCache", "generate", "add_gumbel_noise",
            "get_num_transfer_tokens", "PromptUtilityStudent", "StudentConfig",
            "load_prompt_utility_student", "sparse_dllm_current_score",
+           "teacher_current_attention_score",
            "Backend", "detect_family", "load_model"]

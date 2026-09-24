@@ -44,13 +44,28 @@ def recall_at(pred, target, ratios=RATIOS):
 
     Same definition as train_student.recall_grid, kept per-ratio here because
     the deployed budget is 0.1 and an average over five ratios can hide it.
+    Leading dimensions (for example KV heads) are averaged; Top-K is always
+    taken over the candidate axis.
     """
     out = []
     for r in ratios:
-        k = max(1, int(target.numel() * r))
-        a = set(torch.topk(pred, k).indices.tolist())
-        b = set(torch.topk(target, k).indices.tolist())
-        out.append(len(a & b) / k)
+        k = max(1, int(target.shape[-1] * r))
+        a = torch.topk(pred, k, dim=-1).indices
+        b = torch.topk(target, k, dim=-1).indices
+        intersection = (a.unsqueeze(-1) == b.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+        out.append(float((intersection.float() / k).mean()))
+    return out
+
+
+def jaccard_at(pred, target, ratios=RATIOS):
+    """Jaccard of equal-budget top-k sets, alongside the deployed recall view."""
+    out = []
+    for r in ratios:
+        k = max(1, int(target.shape[-1] * r))
+        a = torch.topk(pred, k, dim=-1).indices
+        b = torch.topk(target, k, dim=-1).indices
+        intersection = (a.unsqueeze(-1) == b.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+        out.append(float((intersection.float() / (2 * k - intersection)).mean()))
     return out
 
 
@@ -122,7 +137,10 @@ def main():
                 bucket = totals.setdefault(
                     name, {"student": [0.0] * len(RATIOS),
                            "baseline": [0.0] * len(RATIOS),
-                           "random": [0.0] * len(RATIOS), "n": 0})
+                           "random": [0.0] * len(RATIOS),
+                           "student_jaccard": [0.0] * len(RATIOS),
+                           "baseline_jaccard": [0.0] * len(RATIOS),
+                           "random_jaccard": [0.0] * len(RATIOS), "n": 0})
                 for l in range(L):
                     tgt = label[l]
                     if not torch.isfinite(tgt).all() or tgt.sum() <= 0:
@@ -136,37 +154,52 @@ def main():
                                                 cand, head="score",
                                                 block_indices=blk).squeeze(0).float()
                     rnd = torch.rand_like(tgt)
-                    if base.numel() != tgt.numel():
+                    # Sparse-dLLM produces one head-averaged ranking shared by
+                    # all KV heads. Against a per-head teacher, compare that
+                    # same deployed ranking with each head, then macro-average.
+                    if base.ndim == 1 and tgt.ndim > 1:
+                        base = base.expand_as(tgt)
+                    if stu.shape != tgt.shape or base.shape != tgt.shape:
                         raise RuntimeError(
-                            f"baseline scores {base.numel()} vs label {tgt.numel()}")
+                            f"score/label shape mismatch at layer {l}: "
+                            f"student={tuple(stu.shape)} baseline={tuple(base.shape)} "
+                            f"label={tuple(tgt.shape)}")
                     for key, pred in (("student", stu), ("baseline", base), ("random", rnd)):
                         for i, v in enumerate(recall_at(pred, tgt)):
                             bucket[key][i] += v
+                        for i, v in enumerate(jaccard_at(pred, tgt)):
+                            bucket[f"{key}_jaccard"][i] += v
                     bucket["n"] += 1
             if (si + 1) % 5 == 0:
                 print(f"  {si+1}/{len(shards)} shards", flush=True)
 
     header = "  ".join(f"@{int(r*100):02d}%" for r in RATIOS)
-    print(f"\n{'domain':14s} {'scorer':9s} {header}   mean")
-    macro = {k: [0.0] * len(RATIOS) for k in ("student", "baseline", "random")}
-    for name in sorted(totals):
-        b = totals[name]
+    macros = {}
+    for metric, suffix in (("recall", ""), ("jaccard", "_jaccard")):
+        print(f"\n{metric.upper()} against teacher future-attention Top-K")
+        print(f"{'domain':14s} {'scorer':9s} {header}   mean")
+        macro = {k: [0.0] * len(RATIOS) for k in ("student", "baseline", "random")}
+        for name in sorted(totals):
+            b = totals[name]
+            for key in ("student", "baseline", "random"):
+                vals = [v / max(1, b["n"]) for v in b[f"{key}{suffix}"]]
+                for i, v in enumerate(vals):
+                    macro[key][i] += v / len(totals)
+                print(f"{name:14s} {key:9s} " +
+                      "  ".join(f"{v:.3f}" for v in vals) +
+                      f"   {sum(vals)/len(vals):.4f}")
+        print()
         for key in ("student", "baseline", "random"):
-            vals = [v / max(1, b["n"]) for v in b[key]]
-            for i, v in enumerate(vals):
-                macro[key][i] += v / len(totals)
-            print(f"{name:14s} {key:9s} " +
-                  "  ".join(f"{v:.3f}" for v in vals) +
-                  f"   {sum(vals)/len(vals):.4f}")
-    print()
-    for key in ("student", "baseline", "random"):
-        print(f"{'MACRO':14s} {key:9s} " +
-              "  ".join(f"{v:.3f}" for v in macro[key]) +
-              f"   {sum(macro[key])/len(macro[key]):.4f}")
+            print(f"{'MACRO':14s} {key:9s} " +
+                  "  ".join(f"{v:.3f}" for v in macro[key]) +
+                  f"   {sum(macro[key])/len(macro[key]):.4f}")
+        macros[metric] = macro
+    macro = macros["recall"]
     gap = macro["student"][1] - macro["baseline"][1]
     print(f"\nat the deployed keep_ratio 0.1: student - baseline = {gap:+.4f}")
     if args.out:
-        json.dump({"per_domain": totals, "macro": macro, "ratios": list(RATIOS)},
+        json.dump({"per_domain": totals, "macro": macro,
+                   "macro_jaccard": macros["jaccard"], "ratios": list(RATIOS)},
                   open(args.out, "w"), indent=2)
         print(f"wrote {args.out}")
 

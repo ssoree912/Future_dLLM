@@ -26,7 +26,8 @@ def generate(model, prompt, steps=None, gen_length=128, block_length=32,
              temperature=0.2, cfg_scale=0., remasking=None,
              mask_id=MASK_ID, cache_scorer=None, *, alg="entropy", top_p=0.95,
              top_k=None, alg_temp=None, eps=1e-3, eviction_method="student",
-             on_block_complete=None, on_step=None, oracle_reduce=None):
+             on_block_complete=None, on_step=None, oracle_reduce=None,
+             current_reduce=None):
     """Return prompt + answer using the reference block sampling schedule.
 
     ``on_block_complete(x, cache, block_index, block_start, selection_input)``
@@ -43,10 +44,12 @@ def generate(model, prompt, steps=None, gen_length=128, block_length=32,
         raise ValueError("block_length must be positive and match model.config.block_len")
     if gen_length < 1 or gen_length % block_length:
         raise ValueError("gen_length must be positive and divisible by block_length")
-    if eviction_method not in ("student", "sparse", "oracle"):
-        raise ValueError("eviction_method must be student, sparse or oracle")
+    if eviction_method not in ("student", "current", "sparse", "oracle"):
+        raise ValueError("eviction_method must be student, current, sparse or oracle")
     if (oracle_reduce is not None) != (eviction_method == "oracle"):
         raise ValueError("oracle_reduce and eviction_method='oracle' go together")
+    if (current_reduce is not None) != (eviction_method == "current"):
+        raise ValueError("current_reduce and eviction_method='current' go together")
     if model.config.keep_ratio < 1 and eviction_method == "student" and cache_scorer is None:
         raise ValueError("student eviction requires a scorer")
 
@@ -130,7 +133,8 @@ def generate(model, prompt, steps=None, gen_length=128, block_length=32,
                 n_layers=model.config.num_hidden_layers, device=model.device,
                 keep_ratio=model.config.keep_ratio, cache_scorer=cache_scorer,
                 prompt_length=prompt_len, generation_length=gen_length,
-                eviction_method=eviction_method, baseline_order=True)
+                eviction_method=eviction_method, current_reduce=current_reduce,
+                baseline_order=True)
             cache.collect_pool = on_block_complete is not None
             if cache.collect_pool and model.config.keep_ratio != 1.0:
                 raise ValueError("teacher collection requires keep_ratio=1.0")

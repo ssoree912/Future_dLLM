@@ -83,6 +83,9 @@ class FutureDLLM(HFLM):
         nll_type: str = "mc",
         log_type: str = "ftb",
         eviction_method: str = "student",
+        current_row_reduce: str = "max",
+        current_group_reduce: str = "mean",
+        current_per_head: bool = True,
         oracle_row_reduce: str = "max",
         oracle_group_reduce: str = "max",
         oracle_per_head: bool = True,
@@ -133,8 +136,16 @@ class FutureDLLM(HFLM):
             str(pretrained), max_seq_len=self._max_seq_len,
             block_length=self._block_len, keep_ratio=self._keep_ratio)
         self._backend = backend
-        if eviction_method not in ("student", "sparse", "oracle"):
-            raise ValueError("eviction_method must be student, sparse or oracle")
+        if eviction_method not in ("student", "current", "sparse", "oracle"):
+            raise ValueError("eviction_method must be student, current, sparse or oracle")
+        self._current_reduce = None
+        if eviction_method == "current":
+            for name, value in (("current_row_reduce", current_row_reduce),
+                                ("current_group_reduce", current_group_reduce)):
+                if value not in ("max", "mean"):
+                    raise ValueError(f"{name} must be max or mean, got {value!r}")
+            self._current_reduce = (current_row_reduce, current_group_reduce,
+                                    bool(current_per_head))
         # The oracle evicts with the label of the block it is decoding, so the
         # row measures what the label can do before asking whether a scorer can
         # predict it. Which label: the two reductions are the same knobs the
@@ -165,6 +176,7 @@ class FutureDLLM(HFLM):
         self._resume_identity = json.dumps({
             "model": str(pretrained), "student": student_path, "keep_ratio": self._keep_ratio,
             "eviction_method": eviction_method, "block_len": self._block_len,
+            "current_reduce": self._current_reduce,
             "eviction_accum": self._eviction_accum,
             "eviction_accum_decay": self._eviction_accum_decay,
             "max_seq_len": self._max_seq_len, "max_prompt_len": self._max_prompt_len,
@@ -226,6 +238,10 @@ class FutureDLLM(HFLM):
             eviction = (f"oracle (label of the decoding block, "
                         f"row={oracle_row_reduce} group={oracle_group_reduce}, "
                         f"{'per head' if oracle_per_head else 'head-averaged'})")
+        elif eviction_method == "current":
+            eviction = (f"current teacher-attention (row={current_row_reduce} "
+                        f"group={current_group_reduce}, "
+                        f"{'per head' if current_per_head else 'head-averaged'})")
         elif eviction_method == "sparse":
             eviction = "sparse (baseline attention score, no checkpoint)"
         else:
@@ -362,6 +378,7 @@ class FutureDLLM(HFLM):
                 prompt_length=prefix_length,
                 generation_length=generation_length,
                 eviction_method=self._eviction_method,
+                current_reduce=self._current_reduce,
                 baseline_order=self._backend.name == "dream",
             )
             full = self._shift(self.model(model_input, block_start, 1, cache).logits)
@@ -455,6 +472,7 @@ class FutureDLLM(HFLM):
                     block_length=self._block_len, mask_id=self._mask_id,
                     cache_scorer=self._scorer, eviction_method=self._eviction_method,
                     oracle_reduce=self._oracle_reduce,
+                    current_reduce=self._current_reduce,
                     **self._dream_decoding.generation_kwargs(gen_length))
         return self._generate(
             self.model, context_enc.to(self.device),
@@ -467,7 +485,8 @@ class FutureDLLM(HFLM):
             eviction_method=self._eviction_method,
             eviction_accum=self._eviction_accum,
             eviction_accum_decay=self._eviction_accum_decay,
-            oracle_reduce=self._oracle_reduce)
+            oracle_reduce=self._oracle_reduce,
+            current_reduce=self._current_reduce)
 
     @torch.no_grad()
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:

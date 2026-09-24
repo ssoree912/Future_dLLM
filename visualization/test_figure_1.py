@@ -2,7 +2,8 @@ import unittest
 
 import torch
 
-from future_dllm import CustomCache, sparse_dllm_current_score
+from future_dllm import (CustomCache, sparse_dllm_current_score,
+                         teacher_current_attention_score)
 from visualization.figure_1 import (
     aggregate_future_rows,
     candidate_regions,
@@ -51,6 +52,52 @@ class SparseDLLMScoreTest(unittest.TestCase):
         torch.testing.assert_close(
             cache.get_cache(0)["k"].flatten(), torch.tensor([0.0, 1.0, 4.0, 5.0])
         )
+
+
+class TeacherCurrentScoreTest(unittest.TestCase):
+    def test_matches_teacher_kernel_with_current_queries(self):
+        torch.manual_seed(7)
+        q = torch.randn(1, 4, 3, 2)
+        candidate_k = torch.randn(1, 2, 5, 2)
+        block_k = torch.randn(1, 2, 3, 2)
+
+        teacher = CustomCache(n_layers=1, device=torch.device("cpu"))
+        teacher.capture_rows = True
+        teacher.capture_per_head = True
+        teacher.group_reduce = "mean"
+        teacher.record_attention(0, q, torch.cat([candidate_k, block_k], dim=-2))
+        expected = teacher.pending_rows[0].amax(dim=1)
+
+        actual = teacher_current_attention_score(
+            q, candidate_k, block_k, row_reduce="max",
+            group_reduce="mean", per_head=True,
+        ).squeeze(0)
+        torch.testing.assert_close(actual, expected)
+
+    def test_current_eviction_keeps_teacher_style_topk_per_kv_head(self):
+        torch.manual_seed(11)
+        cache = CustomCache(
+            n_layers=1, device=torch.device("cpu"), keep_ratio=0.5,
+            eviction_method="current", current_reduce=("max", "mean", True),
+            baseline_order=True,
+        )
+        keys = torch.randn(1, 2, 8, 3)
+        values = torch.arange(16, dtype=torch.float32).view(1, 2, 8, 1)
+        queries = torch.randn(1, 4, 2, 3)
+        cache.update_cache(0, keys, values)
+
+        candidate_k = torch.cat([keys[:, :, :3], keys[:, :, 5:]], dim=2)
+        candidate_v = torch.cat([values[:, :, :3], values[:, :, 5:]], dim=2)
+        scores = teacher_current_attention_score(
+            queries, candidate_k, keys[:, :, 3:5], row_reduce="max",
+            group_reduce="mean", per_head=True,
+        )
+        keep = torch.topk(scores, k=3, dim=-1).indices.squeeze(0)
+        heads = torch.arange(2)[:, None]
+        expected = candidate_v[:, heads, keep]
+
+        cache.filter_cache(0, queries, cur_filtered_len=3, block_len=2)
+        torch.testing.assert_close(cache.get_cache(0)["v"], expected)
 
 
 class FigureMetricsTest(unittest.TestCase):

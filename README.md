@@ -139,3 +139,43 @@ MAX_SEQ_LEN=10240 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/check
 # 길이 일반화 비교가 필요하면 프롬프트만의 상한도 별도로 선택
 MAX_SEQ_LEN=4096 MAX_PROMPT_LEN=2048 scripts/run_eval.sh gov_report 0.1 artifacts/ckpts/<run>/checkpoint-best
 ```
+
+## Future / current eviction 유사도 진단
+
+Dream에서 같은 샘플을 (1) full cache, (2) student의 future score, (3) 현재
+블록 query와 외부 cache key의 attention score로 각각 생성한 뒤 full-cache
+출력과 비교합니다. 순서를 반영하는 token `SequenceMatcher`와 token-set
+Jaccard를 함께 기록합니다. Student가 학습된 `decoding.json`의 step 수를 세
+실행 모두에 자동 적용하며, 이 워크스페이스에서는 물리 GPU 2 하나만
+`cuda:0`으로 노출합니다.
+
+```bash
+LIMIT=10 PY=/opt/conda/envs/future-dllm/bin/python \
+  scripts/run_eviction_similarity.sh gsm8k 0.1 \
+  artifacts/ckpts/<run>/checkpoint-best
+```
+
+결과는 `results/eviction_similarity/.../summary.json`과 `samples.jsonl`에
+저장됩니다. 유사도는 task filter를 거친 정답 문자열이 아니라 raw 생성문으로
+계산합니다. full-cache 출력을 본 뒤 샘플별로 방법을 고르는 것은 online
+oracle이 되므로, 실제 배포 라우팅은 별도 held-out split에서 얻은 **task별**
+결정만 사용해야 합니다.
+
+held-out 진단에서 current가 선택된 task는 teacher label과 같은 scaled
+attention/softmax 및 row/group reduction을 선택 시점 현재 블록에 적용하는
+`eviction_method=current`로 실행합니다. Sparse-dLLM의 kernel-3 pooling을 쓰는
+`eviction_method=sparse`와는 별도이며, Student 체크포인트는 필요하지 않습니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 EVICTION_METHOD=current \
+  scripts/run_eval.sh gsm8k 0.1
+```
+
+Teacher future-attention Top-K 자체에 대한 선택 유사도는 다음처럼 확인합니다.
+출력에는 future student와 current attention 각각의 Recall@K와 Jaccard@K가
+함께 포함됩니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python scripts/baseline_recall.py \
+  --student artifacts/ckpts/<run>/checkpoint-best --limit 1
+```

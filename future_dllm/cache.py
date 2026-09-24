@@ -72,6 +72,74 @@ def sparse_dllm_current_score(
     return importance
 
 
+def teacher_current_attention_score(
+    q_block: torch.Tensor,
+    candidate_k: torch.Tensor,
+    block_k: torch.Tensor,
+    *,
+    row_reduce: str = "max",
+    group_reduce: str = "mean",
+    per_head: bool = True,
+) -> torch.Tensor:
+    """Score the current block exactly like a teacher attention label.
+
+    The teacher observes a *completed future* block.  This score uses the block
+    at cache-selection time instead, but deliberately keeps every other part of
+    the label kernel identical: scaled QK, softmax over external-cache and own-
+    block keys together, removal of the own-block columns, GQA query-head group
+    reduction, and finally block-row reduction.
+
+    Args:
+        q_block: Current block queries, ``[batch, query_heads, rows, head_dim]``.
+        candidate_k: External cache keys, ``[batch, kv_heads, candidates, head_dim]``.
+        block_k: Current block keys, ``[batch, kv_heads, rows, head_dim]``.
+        row_reduce: ``"max"`` or ``"mean"`` over current block rows.
+        group_reduce: ``"max"`` or ``"mean"`` over query heads sharing a KV head.
+        per_head: Keep the KV-head axis, matching a per-head teacher label.
+
+    Returns:
+        ``[batch, kv_heads, candidates]`` when ``per_head`` is true, otherwise
+        ``[batch, candidates]``.
+    """
+    if q_block.ndim != 4 or candidate_k.ndim != 4 or block_k.ndim != 4:
+        raise ValueError("q_block, candidate_k and block_k must be rank-4 tensors")
+    if row_reduce not in ("max", "mean"):
+        raise ValueError("row_reduce must be max or mean")
+    if group_reduce not in ("max", "mean"):
+        raise ValueError("group_reduce must be max or mean")
+    if candidate_k.shape[:2] != block_k.shape[:2]:
+        raise ValueError("candidate and block keys must have matching batch/KV-head axes")
+    if q_block.size(0) != candidate_k.size(0):
+        raise ValueError("query and key batch sizes do not match")
+    if q_block.size(-1) != candidate_k.size(-1) or block_k.size(-1) != candidate_k.size(-1):
+        raise ValueError("query and key head dimensions do not match")
+    if q_block.size(-2) != block_k.size(-2):
+        raise ValueError("q_block and block_k row counts do not match")
+
+    kv_heads = candidate_k.size(1)
+    if q_block.size(1) % kv_heads:
+        raise ValueError("query heads must be divisible by KV heads")
+    group = q_block.size(1) // kv_heads
+    all_k = torch.cat([candidate_k, block_k], dim=-2)
+    if group != 1:
+        all_k = all_k.repeat_interleave(group, dim=1)
+
+    logits = torch.matmul(q_block.float(), all_k.float().transpose(-2, -1))
+    weights = torch.softmax(logits / (q_block.size(-1) ** 0.5), dim=-1)
+    rows = weights[..., :candidate_k.size(-2)]
+
+    if per_head:
+        if group != 1:
+            batch, _, n_rows, n_cols = rows.shape
+            rows = rows.view(batch, kv_heads, group, n_rows, n_cols)
+            rows = (rows.amax(dim=2) if group_reduce == "max"
+                    else rows.mean(dim=2))
+        return rows.amax(dim=-2) if row_reduce == "max" else rows.mean(dim=-2)
+
+    rows = rows.mean(dim=1)
+    return rows.amax(dim=-2) if row_reduce == "max" else rows.mean(dim=-2)
+
+
 class CustomCache:
     """Block-wise KV cache with future-attention eviction.
 
@@ -98,12 +166,20 @@ class CustomCache:
         capture_current_scores: bool = False,
         current_score_pool_kernel: Optional[int] = 3,
         eviction_method: str = "student",
+        current_reduce: Optional[tuple[str, str, bool]] = None,
         baseline_order: bool = False,
         accum_state: Optional[dict] = None,
         accum_decay: float = 1.0,
     ) -> None:
-        if eviction_method not in ("student", "sparse", "oracle"):
-            raise ValueError("eviction_method must be student, sparse or oracle")
+        if eviction_method not in ("student", "current", "sparse", "oracle"):
+            raise ValueError("eviction_method must be student, current, sparse or oracle")
+        if eviction_method == "current":
+            current_reduce = current_reduce or ("max", "mean", True)
+            row_reduce, group_reduce, _ = current_reduce
+            if row_reduce not in ("max", "mean") or group_reduce not in ("max", "mean"):
+                raise ValueError("current reductions must be max or mean")
+        elif current_reduce is not None:
+            raise ValueError("current_reduce requires eviction_method='current'")
         self.cache = {}
         # Running per-layer score buffer shared across blocks, indexed by
         # absolute sequence position. The caller owns it because a cache lives
@@ -111,6 +187,7 @@ class CustomCache:
         self.accum_state = accum_state
         self.accum_decay = float(accum_decay)
         self.eviction_method = eviction_method
+        self.current_reduce = current_reduce
         self.baseline_order = baseline_order
         self.candidate_order = {}
         self.keep_ratios = [keep_ratio for _ in range(n_layers)]
@@ -246,6 +323,23 @@ class CustomCache:
             ).detach()
 
         full_pool = self.collect_pool or self.keep_ratios[layer_id] >= 1.0
+        if self.eviction_method == "current" and not full_pool:
+            block_k = cached_k[:, :, cur_filtered_len:cur_filtered_len + block_len, :]
+            row_reduce, group_reduce, per_head = self.current_reduce
+            scores = teacher_current_attention_score(
+                q_block, keep_k, block_k, row_reduce=row_reduce,
+                group_reduce=group_reduce, per_head=per_head)
+            keep_num = int(keep_k.size(-2) * self.keep_ratios[layer_id])
+            keep_indices = torch.topk(scores, k=keep_num, dim=-1).indices.squeeze(0)
+            if not self.baseline_order:
+                keep_indices = keep_indices.sort(dim=-1).values
+            head_index = torch.arange(keep_k.size(1), device=keep_k.device)[:, None]
+            self.cache[layer_id] = {
+                "k": keep_k[:, head_index, keep_indices],
+                "v": keep_v[:, head_index, keep_indices],
+            }
+            return
+
         if self.eviction_method == "sparse" or (full_pool and self.baseline_order):
             scores = sparse_dllm_current_score(q_block, keep_k, self.current_score_pool_kernel)
             keep_num = keep_k.size(-2) if full_pool else int(
@@ -376,4 +470,3 @@ class CustomCache:
 
     def clear(self):
         self.cache.clear()
-
