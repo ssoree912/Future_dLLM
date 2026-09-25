@@ -206,6 +206,13 @@ class CustomCache:
         self.capture_current_scores = capture_current_scores
         self.current_score_pool_kernel = current_score_pool_kernel
         self.current_scores = {}
+        # The teacher-style current-block score captured alongside it, so a
+        # diagnostic can rank the two current-attention proxies against the same
+        # future label without decoding anything. Deployment reads its reduction
+        # from current_reduce; the capture has no eviction method to read, so it
+        # carries the deployed default.
+        self.current_teacher_scores = {}
+        self.capture_current_reduce = ("max", "mean", True)
 
         # Hidden states the student scores from; the block writes them per layer
         # on the step-1 forward and filter_cache consumes them.
@@ -320,6 +327,13 @@ class CustomCache:
         if self.capture_current_scores:
             self.current_scores[layer_id] = sparse_dllm_current_score(
                 q_block, keep_k, self.current_score_pool_kernel
+            ).detach()
+            row_reduce, group_reduce, per_head = self.capture_current_reduce
+            self.current_teacher_scores[layer_id] = teacher_current_attention_score(
+                q_block,
+                keep_k,
+                cached_k[:, :, cur_filtered_len:cur_filtered_len + block_len, :],
+                row_reduce=row_reduce, group_reduce=group_reduce, per_head=per_head,
             ).detach()
 
         full_pool = self.collect_pool or self.keep_ratios[layer_id] >= 1.0

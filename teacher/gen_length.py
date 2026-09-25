@@ -31,6 +31,7 @@ DATASET_TASK = {
     "multi_news": "longbench/multi_news.yaml",
     "repobench_p": "longbench/repobench-p.yaml",
     "gsm8k": "local/gsm8k.yaml",
+    "humaneval": "local/humaneval.yaml",
     "math": "local/math.yaml",
     "math5s": "local/math.yaml",
     "math_ho_near": "local/math.yaml",

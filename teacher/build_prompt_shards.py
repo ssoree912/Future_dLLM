@@ -131,6 +131,20 @@ def mbpp(limit):
             for i, row in enumerate(table.itertuples())]
 
 
+def humaneval(limit):
+    """The 164 test problems, each prompt exactly as local/humaneval.yaml feeds it.
+
+    ``doc_to_text`` there is ``{{prompt}}`` and the task is not run with a chat
+    template, so the label is built over the same raw signature-and-docstring
+    the eval path sends -- hence its place in RAW_TEXT below.
+    """
+    import pandas as pd
+    table = pd.read_parquet(DATA / "eval/humaneval/test.parquet")
+    if limit:
+        table = table.head(limit)
+    return [(f"humaneval-{i}", row.prompt) for i, row in enumerate(table.itertuples())]
+
+
 def _longbench(path, limit):
     """LongBench train 파일은 평가 parquet과 필드가 바이트 단위로 같다.
     평가에서 쓰는 프롬프트는 context + "\n\n" + question 이다."""
@@ -303,7 +317,7 @@ def mbpp_full(limit):
 
 BUILDERS = {"samsum": samsum, "gsm8k": gsm8k, "mmlu": mmlu, "mbpp": mbpp,
             "samsum_lb": samsum_lb, "trec_lb": trec_lb, "wiki2_lb": wiki2_lb,
-            "math": math, "mbpp_full": mbpp_full,
+            "math": math, "mbpp_full": mbpp_full, "humaneval": humaneval,
             "musique": musique, "qasper": qasper, "gov_report": gov_report,
             "multi_news": multi_news,
             "math5s": math5s, "math_ho_near": math_ho_near,
@@ -311,7 +325,8 @@ BUILDERS = {"samsum": samsum, "gsm8k": gsm8k, "mmlu": mmlu, "mbpp": mbpp,
 
 # LongBench 계열은 평가 경로가 chat template을 쓰지 않는다.
 RAW_TEXT = {"samsum", "samsum_lb", "trec_lb", "wiki2_lb",
-            "musique", "qasper", "gov_report", "multi_news", "repobench_p"}
+            "musique", "qasper", "gov_report", "multi_news", "repobench_p",
+            "humaneval"}
 
 
 def main():

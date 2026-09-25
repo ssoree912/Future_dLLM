@@ -6,9 +6,19 @@ ever measured one side of that: the student reaches val recall 0.7345 against
 the teacher, and nothing said what the baseline scores on the same labels. A
 number with no comparator cannot support the claim either way.
 
-This runs both scorers over the same validation shards the training run held
+This runs every scorer over the same validation shards the training run held
 out, against the same labels, with the same recall metric, and adds a random
-ranker so the scale is readable.
+ranker so the scale is readable. The scorers are the student, Sparse-dLLM's
+pooled current-attention proxy, and the teacher-style current-block score that
+``eviction_method=current`` deploys -- the last one matters because the task
+tables cannot separate it from the future label once the budget is loose.
+
+Four views of the same ranking, because top-k overlap alone is a blunt
+instrument: recall@k and Jaccard@k over the kept set, the share of the future
+block's attention mass that set retains (weighted by how much the block will
+actually look at each entry, and normalised by the best any selection could do
+at that budget), and Spearman over the whole candidate axis, which sees a
+ranking that is right everywhere except at the cut.
 
     student > baseline   the premise holds; look downstream for why it does
                          not show up in the task numbers
@@ -69,6 +79,56 @@ def jaccard_at(pred, target, ratios=RATIOS):
     return out
 
 
+def mass_at(pred, target, ratios=RATIOS):
+    """Future-attention mass the kept set retains, against the best possible.
+
+    Set overlap counts every candidate the same. The label does not: a block
+    pays most of its attention to a few entries, and dropping one of those
+    costs more than dropping a dozen it barely looks at. This scores the mass
+    the selection keeps, normalised by the mass the target's own top-k keeps,
+    so 1.0 means "kept as much of the attention as anything could at this
+    budget" rather than "kept all of it".
+    """
+    out = []
+    for r in ratios:
+        k = max(1, int(target.shape[-1] * r))
+        pred_idx = torch.topk(pred, k, dim=-1).indices
+        best = torch.topk(target, k, dim=-1).values.sum(dim=-1)
+        kept = target.gather(-1, pred_idx).sum(dim=-1)
+        out.append(float((kept / best.clamp_min(1e-12)).mean()))
+    return out
+
+
+def spearman(pred, target):
+    """Rank correlation over the whole candidate axis, averaged over heads.
+
+    Ties are broken by argsort order rather than averaged, which is what the
+    label's exact zeros would need; they sit at the bottom of both rankings, so
+    the effect on the correlation is small and the same for every scorer.
+    """
+    n = target.shape[-1]
+    if n < 2:
+        return 0.0
+    rank = lambda t: t.argsort(dim=-1).argsort(dim=-1).float()
+    a, b = rank(pred), rank(target)
+    a = a - a.mean(dim=-1, keepdim=True)
+    b = b - b.mean(dim=-1, keepdim=True)
+    denom = (a.pow(2).sum(-1) * b.pow(2).sum(-1)).sqrt().clamp_min(1e-12)
+    return float(((a * b).sum(-1) / denom).mean())
+
+
+SCORERS = ("student", "current", "baseline", "random")
+
+
+def new_bucket():
+    b = {"n": 0}
+    for key in SCORERS:
+        for metric in ("recall", "jaccard", "mass"):
+            b[f"{key}_{metric}"] = [0.0] * len(RATIOS)
+        b[f"{key}_spearman"] = 0.0
+    return b
+
+
 def val_shards(roots, caps, val_ratio):
     """The same held-out split train_student.py made: sorted, capped, head slice."""
     out = []
@@ -91,13 +151,36 @@ def main():
                     help="shards per domain; 0 uses the whole val split")
     ap.add_argument("--max-seq-len", type=int, default=2048)
     ap.add_argument("--block-length", type=int, default=32)
+    ap.add_argument("--domains", default="",
+                    help="comma-separated domain folders under --teacher-root to "
+                         "score instead of the checkpoint's own val split. Use it "
+                         "for a domain the student never trained on: there is no "
+                         "split to respect there, so every shard is scored.")
+    ap.add_argument("--teacher-root", default="",
+                    help="directory holding the per-domain shard folders, when "
+                         "meta.json records the path from another machine")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     meta = json.load(open(Path(args.student).parent / "meta.json"))
-    roots = meta["teacher_roots"]
-    caps = [meta["max_shards"][Path(r).name] for r in roots] if meta.get("max_shards") else []
-    shards = val_shards(roots, caps, meta["val_ratio"])
+    if args.domains:
+        if not args.teacher_root:
+            raise SystemExit("--domains needs --teacher-root to resolve against")
+        shards = []
+        for name in [d for d in args.domains.split(",") if d]:
+            found = sorted(glob.glob(str(Path(args.teacher_root) / name / "*.pt")))
+            if not found:
+                raise SystemExit(
+                    f"no teacher shards under {Path(args.teacher_root) / name}")
+            shards += [(name, p) for p in found]
+    else:
+        roots = meta["teacher_roots"]
+        if args.teacher_root:
+            # meta records absolute paths from the box that extracted the shards;
+            # keep the domain names it recorded and re-root them here.
+            roots = [str(Path(args.teacher_root) / Path(r).name) for r in roots]
+        caps = [meta["max_shards"][Path(r).name] for r in roots] if meta.get("max_shards") else []
+        shards = val_shards(roots, caps, meta["val_ratio"])
     if args.limit:
         per = {}
         kept = []
@@ -134,13 +217,7 @@ def main():
                 cand = record["candidate_indices"].to(model.device)
                 blk = torch.arange(ws, ws + wl, device=model.device)
                 label = record["label_final_rowmax"].float().to(model.device)
-                bucket = totals.setdefault(
-                    name, {"student": [0.0] * len(RATIOS),
-                           "baseline": [0.0] * len(RATIOS),
-                           "random": [0.0] * len(RATIOS),
-                           "student_jaccard": [0.0] * len(RATIOS),
-                           "baseline_jaccard": [0.0] * len(RATIOS),
-                           "random_jaccard": [0.0] * len(RATIOS), "n": 0})
+                bucket = totals.setdefault(name, new_bucket())
                 for l in range(L):
                     tgt = label[l]
                     if not torch.isfinite(tgt).all() or tgt.sum() <= 0:
@@ -150,6 +227,7 @@ def main():
                     # permutes anything, and record_attention un-permutes the
                     # label, so the columns line up with each other.
                     base = cache.current_scores[l].squeeze(0).float()
+                    cur = cache.current_teacher_scores[l].squeeze(0).float()
                     stu = student.forward_layer(l, cache.layer_hidden_states[l].float(),
                                                 cand, head="score",
                                                 block_indices=blk).squeeze(0).float()
@@ -159,47 +237,79 @@ def main():
                     # same deployed ranking with each head, then macro-average.
                     if base.ndim == 1 and tgt.ndim > 1:
                         base = base.expand_as(tgt)
-                    if stu.shape != tgt.shape or base.shape != tgt.shape:
-                        raise RuntimeError(
-                            f"score/label shape mismatch at layer {l}: "
-                            f"student={tuple(stu.shape)} baseline={tuple(base.shape)} "
-                            f"label={tuple(tgt.shape)}")
-                    for key, pred in (("student", stu), ("baseline", base), ("random", rnd)):
+                    if cur.ndim == 1 and tgt.ndim > 1:
+                        cur = cur.expand_as(tgt)
+                    for label_name, pred in (("student", stu), ("current", cur),
+                                             ("baseline", base)):
+                        if pred.shape != tgt.shape:
+                            raise RuntimeError(
+                                f"score/label shape mismatch at layer {l}: "
+                                f"{label_name}={tuple(pred.shape)} "
+                                f"label={tuple(tgt.shape)}")
+                    for key, pred in (("student", stu), ("current", cur),
+                                      ("baseline", base), ("random", rnd)):
                         for i, v in enumerate(recall_at(pred, tgt)):
-                            bucket[key][i] += v
+                            bucket[f"{key}_recall"][i] += v
                         for i, v in enumerate(jaccard_at(pred, tgt)):
                             bucket[f"{key}_jaccard"][i] += v
+                        for i, v in enumerate(mass_at(pred, tgt)):
+                            bucket[f"{key}_mass"][i] += v
+                        bucket[f"{key}_spearman"] += spearman(pred, tgt)
                     bucket["n"] += 1
             if (si + 1) % 5 == 0:
                 print(f"  {si+1}/{len(shards)} shards", flush=True)
 
     header = "  ".join(f"@{int(r*100):02d}%" for r in RATIOS)
     macros = {}
-    for metric, suffix in (("recall", ""), ("jaccard", "_jaccard")):
-        print(f"\n{metric.upper()} against teacher future-attention Top-K")
+    for metric in ("recall", "jaccard", "mass"):
+        title = {"recall": "RECALL of the teacher's future-attention Top-K",
+                 "jaccard": "JACCARD of the kept sets",
+                 "mass": "FUTURE-ATTENTION MASS retained (1.0 = the best any "
+                         "selection could keep)"}[metric]
+        print(f"\n{title}")
         print(f"{'domain':14s} {'scorer':9s} {header}   mean")
-        macro = {k: [0.0] * len(RATIOS) for k in ("student", "baseline", "random")}
+        macro = {k: [0.0] * len(RATIOS) for k in SCORERS}
         for name in sorted(totals):
             b = totals[name]
-            for key in ("student", "baseline", "random"):
-                vals = [v / max(1, b["n"]) for v in b[f"{key}{suffix}"]]
+            for key in SCORERS:
+                vals = [v / max(1, b["n"]) for v in b[f"{key}_{metric}"]]
                 for i, v in enumerate(vals):
                     macro[key][i] += v / len(totals)
                 print(f"{name:14s} {key:9s} " +
                       "  ".join(f"{v:.3f}" for v in vals) +
                       f"   {sum(vals)/len(vals):.4f}")
         print()
-        for key in ("student", "baseline", "random"):
+        for key in SCORERS:
             print(f"{'MACRO':14s} {key:9s} " +
                   "  ".join(f"{v:.3f}" for v in macro[key]) +
                   f"   {sum(macro[key])/len(macro[key]):.4f}")
         macros[metric] = macro
-    macro = macros["recall"]
-    gap = macro["student"][1] - macro["baseline"][1]
-    print(f"\nat the deployed keep_ratio 0.1: student - baseline = {gap:+.4f}")
+
+    # Budget-free view: the whole ranking, not the set the cut happens to make.
+    print("\nSPEARMAN against the future-attention label (whole candidate axis)")
+    print(f"{'domain':14s} " + "  ".join(f"{k:>9s}" for k in SCORERS))
+    spear = {k: 0.0 for k in SCORERS}
+    for name in sorted(totals):
+        b = totals[name]
+        vals = {k: b[f"{k}_spearman"] / max(1, b["n"]) for k in SCORERS}
+        for k in SCORERS:
+            spear[k] += vals[k] / len(totals)
+        print(f"{name:14s} " + "  ".join(f"{vals[k]:9.4f}" for k in SCORERS))
+    print(f"{'MACRO':14s} " + "  ".join(f"{spear[k]:9.4f}" for k in SCORERS))
+    macros["spearman"] = spear
+
+    print("\nat the deployed keep_ratio 0.1, against the future label:")
+    for metric in ("recall", "jaccard", "mass"):
+        m = macros[metric]
+        print(f"  {metric:8s} student {m['student'][1]:.4f}   "
+              f"current {m['current'][1]:.4f}   "
+              f"student - current = {m['student'][1] - m['current'][1]:+.4f}")
+    sp = macros["spearman"]
+    print(f"  spearman student {sp['student']:.4f}   current {sp['current']:.4f}   "
+          f"student - current = {sp['student'] - sp['current']:+.4f}")
     if args.out:
-        json.dump({"per_domain": totals, "macro": macro,
-                   "macro_jaccard": macros["jaccard"], "ratios": list(RATIOS)},
+        json.dump({"per_domain": totals, "macro": macros,
+                   "scorers": list(SCORERS), "ratios": list(RATIOS)},
                   open(args.out, "w"), indent=2)
         print(f"wrote {args.out}")
 
