@@ -37,8 +37,12 @@ run() {   # tag dataset keep [ckpt]
   local tag="$1" ds="$2" keep="$3" ckpt="${4:-}"
   # A finished run is one whose store is still on disk: the store is what the
   # table is built from, and its name carries the sample limit, so a scored
-  # result from a different --limit is not this run.
-  if compgen -G "$REPO/results/.resume/${tag}_${ds}_keep${keep}_*.jsonl" > /dev/null; then
+  # result from a different --limit is not this run. A store short of the
+  # limit is a crash rather than a finished run -- it stays where it is, so the
+  # rerun resumes from it instead of starting the documents over.
+  local store
+  store="$(compgen -G "$REPO/results/.resume/${tag}_${ds}_keep${keep}_*.jsonl" | head -1)"
+  if [ -n "$store" ] && { [ -z "${LIMIT:-}" ] || [ "$(wc -l < "$store")" -ge "$LIMIT" ]; }; then
     echo "[skip] $ds $tag keep=$keep" | tee -a "$SUMMARY"; return
   fi
   local started=$SECONDS
